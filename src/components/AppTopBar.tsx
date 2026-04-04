@@ -1,7 +1,8 @@
 import { MaterialIcons } from '@expo/vector-icons';
-import { Pressable, StyleSheet, Text, View } from 'react-native';
+import { Pressable, StyleSheet, View } from 'react-native';
 
-import { colors, fontFamily } from '../theme/tokens';
+import { AppLogo } from './AppLogo';
+import { colors } from '../theme/tokens';
 
 type AppTopBarProps = {
   title: string;
@@ -24,7 +25,7 @@ export function AppTopBar({
         <Pressable onPress={onLeftPress} style={styles.iconButton}>
           <MaterialIcons color={colors.primaryContainer} name={leftIcon} size={24} />
         </Pressable>
-        <Text style={styles.title}>{title}</Text>
+        <AppLogo showWordmark size={30} textColor="#070B2B" wordmark={title} />
       </View>
       <Pressable onPress={onRightPress} style={styles.iconButton}>
         <MaterialIcons color={colors.primaryContainer} name={rightIcon} size={24} />
@@ -56,11 +57,5 @@ const styles = StyleSheet.create({
     height: 40,
     justifyContent: 'center',
     width: 40,
-  },
-  title: {
-    color: '#070B2B',
-    fontFamily: fontFamily.headlineBold,
-    fontSize: 22,
-    letterSpacing: -0.4,
   },
 });

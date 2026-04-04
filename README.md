@@ -21,7 +21,7 @@ Set these environment variables in Render:
 - `SUPABASE_URL`
 - `SUPABASE_SERVICE_ROLE_KEY`
 - `CLERK_SECRET_KEY`
-- `CLIENT_ORIGIN` (for example your Expo web domain or `*` while testing)
+- `CLIENT_ORIGIN` (comma-separated origins are supported, for example `http://localhost:8081,https://your-frontend-domain.com` or `*` while testing)
 
 After deploy, copy the Render service URL and set:
 

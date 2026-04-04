@@ -9,7 +9,11 @@ dotenv.config();
 const app = express();
 const port = Number(process.env.PORT || 10000);
 
-const clientOrigin = process.env.CLIENT_ORIGIN || '*';
+const clientOriginRaw = process.env.CLIENT_ORIGIN || '*';
+const allowedOrigins = clientOriginRaw
+  .split(',')
+  .map((value) => value.trim())
+  .filter(Boolean);
 const supabaseUrl = process.env.SUPABASE_URL;
 const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const clerkSecretKey = process.env.CLERK_SECRET_KEY;
@@ -29,7 +33,20 @@ const supabase = createClient(supabaseUrl, serviceRoleKey, {
 
 app.use(
   cors({
-    origin: clientOrigin === '*' ? true : clientOrigin,
+    origin: (origin, callback) => {
+      // Requests from native mobile apps or server-side calls may not send Origin.
+      if (!origin) {
+        callback(null, true);
+        return;
+      }
+
+      if (allowedOrigins.includes('*') || allowedOrigins.includes(origin)) {
+        callback(null, true);
+        return;
+      }
+
+      callback(new Error(`Origin ${origin} is not allowed by CORS`));
+    },
     credentials: true,
   }),
 );

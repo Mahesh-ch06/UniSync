@@ -12,6 +12,7 @@ import {
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
+import { AppLogo } from '../components/AppLogo';
 import { colors, fontFamily, radii } from '../theme/tokens';
 
 type CompleteNameScreenProps = {
@@ -79,7 +80,9 @@ export function CompleteNameScreen({ onCompleted }: CompleteNameScreenProps) {
         style={styles.keyboardWrap}
       >
         <View style={styles.content}>
-          <Text style={styles.brand}>CampusFind</Text>
+          <View style={styles.brandWrap}>
+            <AppLogo showWordmark size={46} />
+          </View>
           <Text style={styles.title}>One Last Step</Text>
           <Text style={styles.subtitle}>
             Please add your name so others can trust verified claims and handovers.
@@ -125,12 +128,9 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     paddingHorizontal: 24,
   },
-  brand: {
-    color: colors.primary,
-    fontFamily: fontFamily.headlineExtraBold,
-    fontSize: 38,
-    marginBottom: 8,
-    textAlign: 'center',
+  brandWrap: {
+    alignItems: 'center',
+    marginBottom: 12,
   },
   title: {
     color: colors.onSurface,

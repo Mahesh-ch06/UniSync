@@ -1,6 +1,6 @@
 import { MaterialIcons } from '@expo/vector-icons';
 import { useAuth } from '@clerk/clerk-expo';
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Image,
@@ -174,11 +174,16 @@ function FoundItemCard({ item }: { item: FoundItem }) {
 
 export function HomeScreen() {
   const { getToken } = useAuth();
+  const getTokenRef = useRef(getToken);
   const [allItems, setAllItems] = useState<FoundItem[]>([]);
   const [selectedCategory, setSelectedCategory] = useState('All Items');
   const [searchText, setSearchText] = useState('');
   const [isLoading, setIsLoading] = useState(true);
   const [errorText, setErrorText] = useState('');
+
+  useEffect(() => {
+    getTokenRef.current = getToken;
+  }, [getToken]);
 
   const categories = useMemo(() => {
     const uniqueCategories = Array.from(new Set(allItems.map((item) => item.category))).sort();
@@ -224,7 +229,7 @@ export function HomeScreen() {
         return;
       }
 
-      const accessToken = await getToken({ template: 'supabase' }).catch(() => null);
+      const accessToken = await getTokenRef.current({ template: 'supabase' }).catch(() => null);
       const client = buildSupabaseClient(accessToken ?? undefined);
 
       if (!client) {
@@ -259,7 +264,7 @@ export function HomeScreen() {
     } finally {
       setIsLoading(false);
     }
-  }, [getToken]);
+  }, []);
 
   useEffect(() => {
     void loadItems();
@@ -316,7 +321,7 @@ export function HomeScreen() {
         {isLoading ? (
           <View style={styles.loadingWrap}>
             <ActivityIndicator color={colors.primary} size="large" />
-            <Text style={styles.loadingText}>Loading items from Supabase...</Text>
+            <Text style={styles.loadingText}>Loading items...</Text>
           </View>
         ) : errorText ? (
           <View style={styles.emptyStateCard}>

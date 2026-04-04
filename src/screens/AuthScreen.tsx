@@ -14,6 +14,7 @@ import {
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
+import { AppLogo } from '../components/AppLogo';
 import { colors, fontFamily, radii } from '../theme/tokens';
 
 type AuthMode = 'sign-in' | 'sign-up' | 'verify';
@@ -210,7 +211,9 @@ export function AuthScreen() {
         style={styles.keyboardWrap}
       >
         <View style={styles.content}>
-          <Text style={styles.brand}>CampusFind</Text>
+          <View style={styles.brandWrap}>
+            <AppLogo showWordmark size={46} />
+          </View>
           <Text style={styles.title}>{headerTitle}</Text>
           <Text style={styles.subtitle}>{headerSubtitle}</Text>
 
@@ -323,12 +326,9 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     paddingHorizontal: 24,
   },
-  brand: {
-    color: colors.primary,
-    fontFamily: fontFamily.headlineExtraBold,
-    fontSize: 38,
-    marginBottom: 8,
-    textAlign: 'center',
+  brandWrap: {
+    alignItems: 'center',
+    marginBottom: 12,
   },
   title: {
     color: colors.onSurface,

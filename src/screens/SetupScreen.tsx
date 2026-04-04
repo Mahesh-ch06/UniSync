@@ -1,6 +1,7 @@
 import { StyleSheet, Text, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
+import { AppLogo } from '../components/AppLogo';
 import { colors, fontFamily, radii } from '../theme/tokens';
 
 type SetupScreenProps = {
@@ -11,6 +12,9 @@ export function SetupScreen({ missingKeys }: SetupScreenProps) {
   return (
     <SafeAreaView style={styles.safeArea}>
       <View style={styles.container}>
+        <View style={styles.brandWrap}>
+          <AppLogo showWordmark size={44} />
+        </View>
         <Text style={styles.title}>Backend Setup Required</Text>
         <Text style={styles.subtitle}>
           Add these environment variables to a .env file in project root, then restart Expo.
@@ -37,6 +41,10 @@ const styles = StyleSheet.create({
     flex: 1,
     justifyContent: 'center',
     paddingHorizontal: 24,
+  },
+  brandWrap: {
+    alignItems: 'center',
+    marginBottom: 14,
   },
   title: {
     color: colors.primary,
