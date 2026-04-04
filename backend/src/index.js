@@ -124,6 +124,18 @@ function stripBase64Prefix(value) {
   return readText(value).replace(/^data:[^;]+;base64,/, '');
 }
 
+function relationObject(value) {
+  if (Array.isArray(value)) {
+    return value[0] || null;
+  }
+
+  if (value && typeof value === 'object') {
+    return value;
+  }
+
+  return null;
+}
+
 function classifyItemFromSignals({ hintText, fileName, width, height, preferredLabel, preferredCategory }) {
   const joined = `${readText(hintText)} ${readText(fileName)}`.toLowerCase();
 
@@ -313,6 +325,78 @@ async function awardPointsSafely({ userId, points, reason, referenceType, refere
   }
 }
 
+async function resolveUserIdFromAuthHeader(authHeader) {
+  const bearer = readText(authHeader || '');
+  const token = bearer.startsWith('Bearer ') ? bearer.slice(7).trim() : '';
+
+  if (!token || !clerkSecretKey) {
+    return '';
+  }
+
+  try {
+    const payload = await verifyToken(token, { secretKey: clerkSecretKey });
+    return readText(payload.sub);
+  } catch {
+    return '';
+  }
+}
+
+async function buildLatestResolvedMap(foundItemIds) {
+  const validIds = foundItemIds.filter((value) => Boolean(readText(value)));
+
+  if (!validIds.length) {
+    return new Map();
+  }
+
+  const { data, error } = await supabase
+    .from('match_requests')
+    .select('id, found_item_id, claimant_user_id, status, reviewed_at, created_at')
+    .in('found_item_id', validIds)
+    .in('status', ['approved', 'picked_up'])
+    .order('reviewed_at', { ascending: false, nullsFirst: false })
+    .order('created_at', { ascending: false });
+
+  if (error) {
+    throw error;
+  }
+
+  const latestByFoundItem = new Map();
+
+  (data ?? []).forEach((entry) => {
+    const key = readText(entry.found_item_id);
+    if (!key || latestByFoundItem.has(key)) {
+      return;
+    }
+
+    latestByFoundItem.set(key, entry);
+  });
+
+  return latestByFoundItem;
+}
+
+async function assertFoundItemClaimable(foundItemId) {
+  const { data: foundItem, error: foundError } = await supabase
+    .from('found_items')
+    .select('id, title, category, location, image_url, created_at, created_by')
+    .eq('id', foundItemId)
+    .maybeSingle();
+
+  if (foundError) {
+    throw foundError;
+  }
+
+  if (!foundItem) {
+    throw new Error('Found item not found.');
+  }
+
+  const latestMap = await buildLatestResolvedMap([foundItemId]);
+  if (latestMap.has(foundItemId)) {
+    throw new Error('This item has already been claimed and is not public anymore.');
+  }
+
+  return foundItem;
+}
+
 async function requireClerkAuth(req, res, next) {
   if (!clerkSecretKey) {
     res.status(500).json({
@@ -349,19 +433,41 @@ app.get('/health', (_req, res) => {
   });
 });
 
-app.get('/api/found-items', async (_req, res) => {
+app.get('/api/found-items', async (req, res) => {
   try {
+    const requesterUserId = await resolveUserIdFromAuthHeader(req.headers.authorization || '');
+
     const { data, error } = await supabase
       .from('found_items')
       .select('*')
       .order('created_at', { ascending: false })
-      .limit(60);
+      .limit(120);
 
     if (error) {
       throw error;
     }
 
-    res.json({ items: data ?? [] });
+    const rows = data ?? [];
+    const resolvedMap = await buildLatestResolvedMap(rows.map((item) => item.id));
+
+    const items = rows.filter((item) => {
+      const resolved = resolvedMap.get(item.id);
+
+      if (!resolved) {
+        return true;
+      }
+
+      if (!requesterUserId) {
+        return false;
+      }
+
+      const ownerId = readText(item.created_by);
+      const claimantId = readText(resolved.claimant_user_id);
+
+      return requesterUserId === ownerId || requesterUserId === claimantId;
+    });
+
+    res.json({ items });
   } catch (error) {
     res.status(500).json({
       error: 'Failed to fetch found items.',
@@ -668,7 +774,7 @@ app.post('/api/match-requests/auto', requireClerkAuth, async (req, res) => {
 
     const { data: foundItems, error: foundError } = await supabase
       .from('found_items')
-      .select('id, title, category, location, image_url, created_at')
+      .select('id, title, category, location, image_url, created_at, created_by')
       .order('created_at', { ascending: false })
       .limit(120);
 
@@ -676,7 +782,11 @@ app.post('/api/match-requests/auto', requireClerkAuth, async (req, res) => {
       throw foundError;
     }
 
-    if (!foundItems || !foundItems.length) {
+    const rawFoundItems = foundItems ?? [];
+    const resolvedMap = await buildLatestResolvedMap(rawFoundItems.map((item) => item.id));
+    const claimableFoundItems = rawFoundItems.filter((item) => !resolvedMap.has(item.id));
+
+    if (!claimableFoundItems.length) {
       res.status(200).json({
         matched: false,
         reason: 'No found items available to match against yet.',
@@ -687,7 +797,7 @@ app.post('/api/match-requests/auto', requireClerkAuth, async (req, res) => {
       return;
     }
 
-    const scored = foundItems
+    const scored = claimableFoundItems
       .map((candidate) => ({
         candidate,
         score: computeMatchScore({
@@ -768,6 +878,576 @@ app.post('/api/match-requests/auto', requireClerkAuth, async (req, res) => {
   } catch (error) {
     res.status(500).json({
       error: 'Failed to auto-submit match request.',
+      details: error && typeof error === 'object' && 'message' in error ? error.message : null,
+    });
+  }
+});
+
+app.post('/api/match-requests', requireClerkAuth, async (req, res) => {
+  const body = req.body || {};
+
+  const foundItemId = readText(body.found_item_id);
+  const proofImageBase64 = readText(body.proof_image_base64);
+  const proofImageUrlInput = readText(body.proof_image_url);
+  const hintText = readText(body.hint_text);
+  const locationHint = readText(body.location_hint);
+  const lostTitle = readText(body.lost_title);
+  const lostDescription = readText(body.lost_description);
+
+  if (!foundItemId) {
+    res.status(400).json({ error: 'found_item_id is required.' });
+    return;
+  }
+
+  if (!proofImageBase64 && !proofImageUrlInput) {
+    res.status(400).json({ error: 'Attach a valid proof image to submit claim request.' });
+    return;
+  }
+
+  try {
+    const foundItem = await assertFoundItemClaimable(foundItemId);
+
+    if (readText(foundItem.created_by) === req.auth.userId) {
+      res.status(400).json({ error: 'You cannot claim your own uploaded found item.' });
+      return;
+    }
+
+    let proofImageUrl = proofImageUrlInput || null;
+
+    if (!proofImageUrl && proofImageBase64) {
+      const uploadedProof = await uploadBase64Image({
+        imageBase64: proofImageBase64,
+        mimeType: normalizeMimeType(body.mime_type),
+        folder: 'proof',
+        userId: req.auth.userId,
+      });
+
+      proofImageUrl = uploadedProof.imageUrl;
+    }
+
+    const detection = classifyItemFromSignals({
+      hintText: `${hintText} ${lostTitle} ${lostDescription}`,
+      fileName: body.file_name,
+      width: body.width,
+      height: body.height,
+      preferredLabel: body.detected_label,
+      preferredCategory: body.detected_category || foundItem.category,
+    });
+
+    let lostItemId = readText(body.lost_item_id);
+
+    if (!lostItemId) {
+      const { data: createdLost, error: lostInsertError } = await supabase
+        .from('lost_items')
+        .insert({
+          title: lostTitle || `Lost ${foundItem.title}`,
+          description: lostDescription || hintText || null,
+          category: detection.category || foundItem.category || 'General',
+          expected_location: locationHint || foundItem.location || null,
+          image_url: proofImageUrl,
+          ai_detected_label: detection.label,
+          reported_by: req.auth.userId,
+          status: 'matched',
+        })
+        .select('id')
+        .single();
+
+      if (lostInsertError) {
+        throw lostInsertError;
+      }
+
+      lostItemId = createdLost.id;
+
+      await awardPointsSafely({
+        userId: req.auth.userId,
+        points: 8,
+        reason: 'lost_item_reported',
+        referenceType: 'lost_item',
+        referenceId: lostItemId,
+      });
+    }
+
+    const computedScore = computeMatchScore({
+      foundItem,
+      detection,
+      hintText,
+      locationHint,
+    });
+
+    const { data: existingSubmitted, error: existingError } = await supabase
+      .from('match_requests')
+      .select('id')
+      .eq('found_item_id', foundItemId)
+      .eq('claimant_user_id', req.auth.userId)
+      .eq('status', 'submitted')
+      .limit(1);
+
+    if (existingError) {
+      throw existingError;
+    }
+
+    if (existingSubmitted && existingSubmitted.length) {
+      res.status(409).json({ error: 'You already have a pending request for this item.' });
+      return;
+    }
+
+    const { data: requestRow, error: requestError } = await supabase
+      .from('match_requests')
+      .insert({
+        found_item_id: foundItemId,
+        lost_item_id: lostItemId,
+        claimant_user_id: req.auth.userId,
+        proof_image_url: proofImageUrl,
+        ai_detected_label: detection.label,
+        match_score: computedScore,
+        status: 'submitted',
+      })
+      .select('*')
+      .single();
+
+    if (requestError) {
+      throw requestError;
+    }
+
+    await awardPointsSafely({
+      userId: req.auth.userId,
+      points: 12,
+      reason: 'match_request_submitted',
+      referenceType: 'match_request',
+      referenceId: requestRow.id,
+    });
+
+    res.status(201).json({
+      request: requestRow,
+      foundItem,
+      proofImageUrl: proofImageUrl,
+      detection,
+      pointsAwarded: 12,
+    });
+  } catch (error) {
+    res.status(500).json({
+      error: 'Failed to submit claim request.',
+      details: error && typeof error === 'object' && 'message' in error ? error.message : null,
+    });
+  }
+});
+
+app.get('/api/match-requests/inbox', requireClerkAuth, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('match_requests')
+      .select(
+        `
+        id,
+        found_item_id,
+        lost_item_id,
+        claimant_user_id,
+        proof_image_url,
+        ai_detected_label,
+        match_score,
+        status,
+        created_at,
+        found_item:found_items!inner(
+          id,
+          title,
+          category,
+          location,
+          image_url,
+          created_by
+        ),
+        lost_item:lost_items(
+          id,
+          title,
+          category,
+          expected_location,
+          image_url,
+          reported_by
+        )
+      `,
+      )
+      .eq('status', 'submitted')
+      .eq('found_items.created_by', req.auth.userId)
+      .order('created_at', { ascending: false })
+      .limit(24);
+
+    if (error) {
+      throw error;
+    }
+
+    const items = (data ?? []).map((row) => ({
+      ...row,
+      found_item: relationObject(row.found_item),
+      lost_item: relationObject(row.lost_item),
+    }));
+
+    res.json({ items });
+  } catch (error) {
+    res.status(500).json({
+      error: 'Failed to fetch incoming claim inbox.',
+      details: error && typeof error === 'object' && 'message' in error ? error.message : null,
+    });
+  }
+});
+
+app.get('/api/match-requests/history/me', requireClerkAuth, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('match_requests')
+      .select(
+        `
+        id,
+        found_item_id,
+        lost_item_id,
+        claimant_user_id,
+        proof_image_url,
+        ai_detected_label,
+        match_score,
+        status,
+        created_at,
+        reviewed_at,
+        reviewer_user_id,
+        pickup_confirmed_at,
+        pickup_confirmed_by,
+        found_item:found_items(
+          id,
+          title,
+          category,
+          location,
+          image_url,
+          created_by
+        ),
+        lost_item:lost_items(
+          id,
+          title,
+          category,
+          expected_location,
+          image_url,
+          reported_by
+        )
+      `,
+      )
+      .in('status', ['approved', 'rejected', 'picked_up', 'cancelled'])
+      .order('created_at', { ascending: false })
+      .limit(120);
+
+    if (error) {
+      throw error;
+    }
+
+    const userId = req.auth.userId;
+    const items = (data ?? [])
+      .map((row) => ({
+        ...row,
+        found_item: relationObject(row.found_item),
+        lost_item: relationObject(row.lost_item),
+      }))
+      .filter((row) => {
+        const ownerId = readText(row.found_item?.created_by);
+        const claimantId = readText(row.claimant_user_id);
+        return ownerId === userId || claimantId === userId;
+      });
+
+    res.json({ items });
+  } catch (error) {
+    res.status(500).json({
+      error: 'Failed to fetch claim history.',
+      details: error && typeof error === 'object' && 'message' in error ? error.message : null,
+    });
+  }
+});
+
+app.post('/api/match-requests/:requestId/resolve', requireClerkAuth, async (req, res) => {
+  const requestId = readText(req.params.requestId);
+  const action = readText(req.body?.action).toLowerCase();
+
+  if (!requestId) {
+    res.status(400).json({ error: 'requestId is required.' });
+    return;
+  }
+
+  if (action !== 'approve' && action !== 'reject') {
+    res.status(400).json({ error: 'action must be approve or reject.' });
+    return;
+  }
+
+  try {
+    const { data: requestRow, error: requestError } = await supabase
+      .from('match_requests')
+      .select(
+        `
+        id,
+        found_item_id,
+        lost_item_id,
+        claimant_user_id,
+        status,
+        match_score,
+        found_item:found_items!inner(
+          id,
+          title,
+          created_by
+        ),
+        lost_item:lost_items(
+          id,
+          title,
+          status,
+          reported_by
+        )
+      `,
+      )
+      .eq('id', requestId)
+      .maybeSingle();
+
+    if (requestError) {
+      throw requestError;
+    }
+
+    if (!requestRow) {
+      res.status(404).json({ error: 'Match request not found.' });
+      return;
+    }
+
+    const foundItem = relationObject(requestRow.found_item);
+    if (!foundItem || readText(foundItem.created_by) !== req.auth.userId) {
+      res.status(403).json({ error: 'Only the finder can review this claim request.' });
+      return;
+    }
+
+    if (readText(requestRow.status) !== 'submitted') {
+      res.status(409).json({ error: 'This request has already been reviewed.' });
+      return;
+    }
+
+    const nowIso = new Date().toISOString();
+
+    if (action === 'reject') {
+      const { data: updatedRequest, error: updateError } = await supabase
+        .from('match_requests')
+        .update({
+          status: 'rejected',
+          reviewed_at: nowIso,
+          reviewer_user_id: req.auth.userId,
+        })
+        .eq('id', requestId)
+        .eq('status', 'submitted')
+        .select('*')
+        .maybeSingle();
+
+      if (updateError) {
+        throw updateError;
+      }
+
+      if (!updatedRequest) {
+        res.status(409).json({ error: 'Request could not be rejected. It may already be resolved.' });
+        return;
+      }
+
+      res.json({ resolved: true, action: 'reject', request: updatedRequest });
+      return;
+    }
+
+    const { data: existingApproved, error: approvedError } = await supabase
+      .from('match_requests')
+      .select('id')
+      .eq('found_item_id', requestRow.found_item_id)
+      .eq('status', 'approved')
+      .neq('id', requestId)
+      .limit(1);
+
+    if (approvedError) {
+      throw approvedError;
+    }
+
+    if (existingApproved && existingApproved.length) {
+      res.status(409).json({ error: 'This found item already has an approved claim.' });
+      return;
+    }
+
+    const { data: updatedRequest, error: updateError } = await supabase
+      .from('match_requests')
+      .update({
+        status: 'approved',
+        reviewed_at: nowIso,
+        reviewer_user_id: req.auth.userId,
+      })
+      .eq('id', requestId)
+      .eq('status', 'submitted')
+      .select('*')
+      .maybeSingle();
+
+    if (updateError) {
+      throw updateError;
+    }
+
+    if (!updatedRequest) {
+      res.status(409).json({ error: 'Request could not be approved. It may already be resolved.' });
+      return;
+    }
+
+    await supabase
+      .from('match_requests')
+      .update({
+        status: 'rejected',
+        reviewed_at: nowIso,
+        reviewer_user_id: req.auth.userId,
+      })
+      .eq('found_item_id', requestRow.found_item_id)
+      .eq('status', 'submitted')
+      .neq('id', requestId);
+
+    await supabase
+      .from('lost_items')
+      .update({ status: 'claimed' })
+      .eq('id', requestRow.lost_item_id);
+
+    const finderUserId = readText(foundItem.created_by);
+    const claimantUserId = readText(requestRow.claimant_user_id);
+
+    const finderPointsAwarded = 35;
+    const claimantPointsAwarded = finderUserId && finderUserId !== claimantUserId ? 20 : 0;
+
+    await awardPointsSafely({
+      userId: finderUserId,
+      points: finderPointsAwarded,
+      reason: 'found_item_claimed_by_owner',
+      referenceType: 'match_request',
+      referenceId: updatedRequest.id,
+    });
+
+    if (claimantPointsAwarded > 0) {
+      await awardPointsSafely({
+        userId: claimantUserId,
+        points: claimantPointsAwarded,
+        reason: 'ownership_verified',
+        referenceType: 'match_request',
+        referenceId: updatedRequest.id,
+      });
+    }
+
+    res.json({
+      resolved: true,
+      action: 'approve',
+      request: updatedRequest,
+      finderPointsAwarded,
+      claimantPointsAwarded,
+    });
+  } catch (error) {
+    res.status(500).json({
+      error: 'Failed to resolve match request.',
+      details: error && typeof error === 'object' && 'message' in error ? error.message : null,
+    });
+  }
+});
+
+app.post('/api/match-requests/:requestId/confirm-pickup', requireClerkAuth, async (req, res) => {
+  const requestId = readText(req.params.requestId);
+
+  if (!requestId) {
+    res.status(400).json({ error: 'requestId is required.' });
+    return;
+  }
+
+  try {
+    const { data: requestRow, error: requestError } = await supabase
+      .from('match_requests')
+      .select(
+        `
+        id,
+        found_item_id,
+        lost_item_id,
+        claimant_user_id,
+        status,
+        found_item:found_items!inner(
+          id,
+          title,
+          created_by
+        )
+      `,
+      )
+      .eq('id', requestId)
+      .maybeSingle();
+
+    if (requestError) {
+      throw requestError;
+    }
+
+    if (!requestRow) {
+      res.status(404).json({ error: 'Match request not found.' });
+      return;
+    }
+
+    const foundItem = relationObject(requestRow.found_item);
+    const ownerId = readText(foundItem?.created_by);
+
+    if (ownerId !== req.auth.userId) {
+      res.status(403).json({ error: 'Only uploader can confirm owner pickup.' });
+      return;
+    }
+
+    if (readText(requestRow.status) !== 'approved') {
+      res.status(409).json({ error: 'Only approved claims can be marked as picked up.' });
+      return;
+    }
+
+    const nowIso = new Date().toISOString();
+
+    const { data: updatedRequest, error: updateError } = await supabase
+      .from('match_requests')
+      .update({
+        status: 'picked_up',
+        pickup_confirmed_at: nowIso,
+        pickup_confirmed_by: req.auth.userId,
+      })
+      .eq('id', requestId)
+      .eq('status', 'approved')
+      .select('*')
+      .maybeSingle();
+
+    if (updateError) {
+      throw updateError;
+    }
+
+    if (!updatedRequest) {
+      res.status(409).json({ error: 'Pickup confirmation failed. Request state changed.' });
+      return;
+    }
+
+    await supabase
+      .from('lost_items')
+      .update({ status: 'closed' })
+      .eq('id', requestRow.lost_item_id);
+
+    const claimantUserId = readText(requestRow.claimant_user_id);
+
+    const finderPickupPoints = 15;
+    const claimantPickupPoints = ownerId !== claimantUserId ? 10 : 0;
+
+    await awardPointsSafely({
+      userId: ownerId,
+      points: finderPickupPoints,
+      reason: 'owner_pickup_confirmed',
+      referenceType: 'match_request',
+      referenceId: updatedRequest.id,
+    });
+
+    if (claimantPickupPoints > 0) {
+      await awardPointsSafely({
+        userId: claimantUserId,
+        points: claimantPickupPoints,
+        reason: 'item_received',
+        referenceType: 'match_request',
+        referenceId: updatedRequest.id,
+      });
+    }
+
+    res.json({
+      confirmed: true,
+      request: updatedRequest,
+      finderPickupPoints,
+      claimantPickupPoints,
+    });
+  } catch (error) {
+    res.status(500).json({
+      error: 'Failed to confirm pickup.',
       details: error && typeof error === 'object' && 'message' in error ? error.message : null,
     });
   }

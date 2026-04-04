@@ -15,3 +15,5 @@ Run files in numeric order:
 11. 011_create_loss_match_points_schema.sql
 12. 012_enable_rls_loss_match_points.sql
 13. 013_verify_loss_match_points.sql (optional)
+14. 014_match_request_pickup_lifecycle.sql
+15. 015_verify_match_request_pickup_history.sql (optional)

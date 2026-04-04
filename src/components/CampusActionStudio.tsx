@@ -1,5 +1,6 @@
 import { MaterialIcons } from '@expo/vector-icons';
 import { useAuth } from '@clerk/clerk-expo';
+import { useUser } from '@clerk/clerk-expo';
 import * as ImagePicker from 'expo-image-picker';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
@@ -50,6 +51,42 @@ type LostBoardItem = {
   ai_detected_label: string | null;
 };
 
+type IncomingClaim = {
+  id: string;
+  match_score: number;
+  status: string;
+  created_at: string | null;
+  proof_image_url: string | null;
+  ai_detected_label: string | null;
+  claimant_user_id: string;
+  reviewer_user_id: string | null;
+  reviewed_at: string | null;
+  pickup_confirmed_at: string | null;
+  pickup_confirmed_by: string | null;
+  found_item: {
+    id: string;
+    title: string;
+    location: string;
+    category: string;
+    image_url: string | null;
+    created_by?: string;
+  };
+  lost_item: {
+    id: string;
+    title: string;
+    category: string;
+    expected_location: string | null;
+  } | null;
+};
+
+type ClaimableItemOption = {
+  id: string;
+  title: string;
+  category: string;
+  location: string;
+  image_url: string | null;
+};
+
 type PointsActivity = {
   id: number;
   points: number;
@@ -65,6 +102,8 @@ type PointsSummary = {
 
 type CampusActionStudioProps = {
   onActionsFinished?: () => Promise<void> | void;
+  compact?: boolean;
+  claimableItems?: ClaimableItemOption[];
 };
 
 const LEVEL_STEPS = [
@@ -164,6 +203,62 @@ function normalizeScanDetection(value: unknown): ScanDetection {
   };
 }
 
+function normalizeIncomingClaim(value: unknown): IncomingClaim | null {
+  if (!value || typeof value !== 'object') {
+    return null;
+  }
+
+  const row = value as Record<string, unknown>;
+  const foundItemRaw =
+    row.found_item && typeof row.found_item === 'object'
+      ? (row.found_item as Record<string, unknown>)
+      : null;
+
+  if (!foundItemRaw) {
+    return null;
+  }
+
+  const foundItemId = safeString(foundItemRaw.id);
+  if (!foundItemId) {
+    return null;
+  }
+
+  const lostItemRaw =
+    row.lost_item && typeof row.lost_item === 'object'
+      ? (row.lost_item as Record<string, unknown>)
+      : null;
+
+  return {
+    id: safeString(row.id),
+    match_score: Math.max(0, safeNumber(row.match_score)),
+    status: safeString(row.status) || 'submitted',
+    created_at: safeString(row.created_at) || null,
+    proof_image_url: safeString(row.proof_image_url) || null,
+    ai_detected_label: safeString(row.ai_detected_label) || null,
+    claimant_user_id: safeString(row.claimant_user_id),
+    reviewer_user_id: safeString(row.reviewer_user_id) || null,
+    reviewed_at: safeString(row.reviewed_at) || null,
+    pickup_confirmed_at: safeString(row.pickup_confirmed_at) || null,
+    pickup_confirmed_by: safeString(row.pickup_confirmed_by) || null,
+    found_item: {
+      id: foundItemId,
+      title: safeString(foundItemRaw.title) || 'Found item',
+      location: safeString(foundItemRaw.location) || 'Campus location',
+      category: safeString(foundItemRaw.category) || 'General',
+      image_url: safeString(foundItemRaw.image_url) || null,
+      created_by: safeString(foundItemRaw.created_by) || undefined,
+    },
+    lost_item: lostItemRaw
+      ? {
+          id: safeString(lostItemRaw.id),
+          title: safeString(lostItemRaw.title) || 'Lost item',
+          category: safeString(lostItemRaw.category) || 'General',
+          expected_location: safeString(lostItemRaw.expected_location) || null,
+        }
+      : null,
+  };
+}
+
 function nextLevelProgress(points: number): { nextLabel: string; remaining: number; ratio: number } {
   const step =
     LEVEL_STEPS.find((entry) => points >= entry.min && points <= entry.max) || LEVEL_STEPS[0];
@@ -186,9 +281,15 @@ function nextLevelProgress(points: number): { nextLabel: string; remaining: numb
   };
 }
 
-export function CampusActionStudio({ onActionsFinished }: CampusActionStudioProps) {
+export function CampusActionStudio({
+  onActionsFinished,
+  compact = false,
+  claimableItems = [],
+}: CampusActionStudioProps) {
   const { getToken } = useAuth();
+  const { user } = useUser();
   const getTokenRef = useRef(getToken);
+  const currentUserId = safeString(user?.id);
 
   const backendBaseUrl = useMemo(() => backendEnv.backendUrl.replace(/\/+$/, ''), []);
 
@@ -198,8 +299,13 @@ export function CampusActionStudio({ onActionsFinished }: CampusActionStudioProp
     recentActivity: [],
   });
   const [lostBoard, setLostBoard] = useState<LostBoardItem[]>([]);
+  const [incomingClaims, setIncomingClaims] = useState<IncomingClaim[]>([]);
+  const [claimHistory, setClaimHistory] = useState<IncomingClaim[]>([]);
   const [panelError, setPanelError] = useState('');
+  const [panelNotice, setPanelNotice] = useState('');
   const [isPanelLoading, setIsPanelLoading] = useState(true);
+  const [isResolvingClaimId, setIsResolvingClaimId] = useState('');
+  const [isConfirmingPickupId, setIsConfirmingPickupId] = useState('');
 
   const [isModalVisible, setIsModalVisible] = useState(false);
   const [mode, setMode] = useState<StudioMode>('lost');
@@ -210,6 +316,7 @@ export function CampusActionStudio({ onActionsFinished }: CampusActionStudioProp
   const [title, setTitle] = useState('');
   const [description, setDescription] = useState('');
   const [locationHint, setLocationHint] = useState('');
+  const [selectedClaimItemId, setSelectedClaimItemId] = useState('');
 
   const [isWorking, setIsWorking] = useState(false);
   const [actionError, setActionError] = useState('');
@@ -224,7 +331,38 @@ export function CampusActionStudio({ onActionsFinished }: CampusActionStudioProp
     [points.totalPoints],
   );
 
+  const quickWidgetMetrics = useMemo(
+    () => ({
+      openLostCount: lostBoard.length,
+      pendingClaimsCount: incomingClaims.length,
+      recentRewards: points.recentActivity.filter((entry) => entry.points > 0).length,
+      historyCount: claimHistory.length,
+    }),
+    [claimHistory.length, incomingClaims.length, lostBoard.length, points.recentActivity],
+  );
+
+  const pickupQueue = useMemo(
+    () =>
+      claimHistory
+        .filter(
+          (entry) =>
+            entry.status === 'approved' &&
+            safeString(entry.found_item.created_by) === currentUserId,
+        )
+        .slice(0, compact ? 1 : 4),
+    [claimHistory, compact, currentUserId],
+  );
+
+  const selectedClaimItem = useMemo(
+    () => claimableItems.find((item) => item.id === selectedClaimItemId) ?? null,
+    [claimableItems, selectedClaimItemId],
+  );
+
   const readResponseError = useCallback(async (response: Response): Promise<string> => {
+    if (response.status === 404) {
+      return 'This feature route is not available on the backend yet.';
+    }
+
     try {
       const payload = (await response.json()) as { error?: unknown; details?: unknown };
 
@@ -278,79 +416,143 @@ export function CampusActionStudio({ onActionsFinished }: CampusActionStudioProp
     setIsPanelLoading(true);
 
     try {
-      const token = await getTokenRef.current();
+      const token = await getTokenRef.current().catch(() => null);
 
-      if (!token) {
-        throw new Error('Sign in required to load points and actions.');
-      }
+      let nextPanelError = '';
+      let nextPanelNotice = '';
 
-      const [pointsResponse, lostResponse] = await Promise.all([
-        fetch(`${backendBaseUrl}/api/points/me`, {
-          headers: {
-            Authorization: `Bearer ${token}`,
-          },
-        }),
-        fetch(`${backendBaseUrl}/api/lost-items`),
-      ]);
-
-      if (!pointsResponse.ok) {
-        throw new Error(await readResponseError(pointsResponse));
-      }
-
-      if (!lostResponse.ok) {
-        throw new Error(await readResponseError(lostResponse));
-      }
-
-      const pointsPayload = (await pointsResponse.json()) as {
-        totalPoints?: unknown;
-        level?: unknown;
-        recentActivity?: unknown;
+      let normalizedPoints: PointsSummary = {
+        totalPoints: 0,
+        level: 'Seed',
+        recentActivity: [],
       };
 
-      const lostPayload = (await lostResponse.json()) as {
-        items?: unknown;
-      };
+      let normalizedLostItems: LostBoardItem[] = [];
+      let normalizedIncomingClaims: IncomingClaim[] = [];
+      let normalizedClaimHistory: IncomingClaim[] = [];
 
-      const normalizedPoints: PointsSummary = {
-        totalPoints: Math.max(0, safeNumber(pointsPayload.totalPoints)),
-        level: safeString(pointsPayload.level) || 'Seed',
-        recentActivity: Array.isArray(pointsPayload.recentActivity)
-          ? pointsPayload.recentActivity
-              .map((row, index) => {
+      const lostResponse = await fetch(`${backendBaseUrl}/api/lost-items`);
+
+      if (lostResponse.ok) {
+        const lostPayload = (await lostResponse.json()) as { items?: unknown };
+
+        normalizedLostItems = Array.isArray(lostPayload.items)
+          ? lostPayload.items
+              .map((row) => {
                 const item = row as Record<string, unknown>;
 
                 return {
-                  id: safeNumber(item.id) || index + 1,
-                  points: safeNumber(item.points),
-                  reason: safeString(item.reason) || 'activity',
-                  created_at: safeString(item.created_at) || new Date().toISOString(),
+                  id: safeString(item.id),
+                  title: safeString(item.title) || 'Untitled item',
+                  category: safeString(item.category) || 'General',
+                  expected_location: safeString(item.expected_location) || null,
+                  image_url: safeString(item.image_url) || null,
+                  created_at: safeString(item.created_at) || null,
+                  ai_detected_label: safeString(item.ai_detected_label) || null,
                 };
               })
-              .slice(0, 5)
-          : [],
-      };
+              .filter((item) => Boolean(item.id))
+              .slice(0, 12)
+          : [];
+      } else {
+        nextPanelError = await readResponseError(lostResponse);
+      }
 
-      const normalizedLostItems: LostBoardItem[] = Array.isArray(lostPayload.items)
-        ? lostPayload.items
-            .map((row) => {
-              const item = row as Record<string, unknown>;
+      if (!token) {
+        nextPanelNotice = nextPanelNotice || 'Sign in to load points and claim inbox.';
+      } else {
+        const [pointsResponse, inboxResponse, historyResponse] = await Promise.all([
+          fetch(`${backendBaseUrl}/api/points/me`, {
+            headers: {
+              Authorization: `Bearer ${token}`,
+            },
+          }),
+          fetch(`${backendBaseUrl}/api/match-requests/inbox`, {
+            headers: {
+              Authorization: `Bearer ${token}`,
+            },
+          }),
+          fetch(`${backendBaseUrl}/api/match-requests/history/me`, {
+            headers: {
+              Authorization: `Bearer ${token}`,
+            },
+          }),
+        ]);
 
-              return {
-                id: safeString(item.id),
-                title: safeString(item.title) || 'Untitled item',
-                category: safeString(item.category) || 'General',
-                expected_location: safeString(item.expected_location) || null,
-                image_url: safeString(item.image_url) || null,
-                created_at: safeString(item.created_at) || null,
-                ai_detected_label: safeString(item.ai_detected_label) || null,
-              };
-            })
-            .filter((item) => Boolean(item.id))
-            .slice(0, 12)
-        : [];
+        if (pointsResponse.ok) {
+          const pointsPayload = (await pointsResponse.json()) as {
+            totalPoints?: unknown;
+            level?: unknown;
+            recentActivity?: unknown;
+          };
+
+          normalizedPoints = {
+            totalPoints: Math.max(0, safeNumber(pointsPayload.totalPoints)),
+            level: safeString(pointsPayload.level) || 'Seed',
+            recentActivity: Array.isArray(pointsPayload.recentActivity)
+              ? pointsPayload.recentActivity
+                  .map((row, index) => {
+                    const item = row as Record<string, unknown>;
+
+                    return {
+                      id: safeNumber(item.id) || index + 1,
+                      points: safeNumber(item.points),
+                      reason: safeString(item.reason) || 'activity',
+                      created_at: safeString(item.created_at) || new Date().toISOString(),
+                    };
+                  })
+                  .slice(0, 5)
+              : [],
+          };
+        } else {
+          nextPanelNotice =
+            nextPanelNotice ||
+            (pointsResponse.status === 404
+              ? 'Points service not deployed yet on backend.'
+              : 'Points are temporarily unavailable.');
+        }
+
+        if (inboxResponse.ok) {
+          const inboxPayload = (await inboxResponse.json()) as { items?: unknown };
+
+          normalizedIncomingClaims = Array.isArray(inboxPayload.items)
+            ? inboxPayload.items
+                .map((item) => normalizeIncomingClaim(item))
+                .filter((item): item is IncomingClaim => Boolean(item))
+                .slice(0, 12)
+            : [];
+        } else {
+          nextPanelNotice =
+            nextPanelNotice ||
+            (inboxResponse.status === 404
+              ? 'Claim inbox is not deployed on backend yet.'
+              : 'Claim inbox is temporarily unavailable.');
+        }
+
+        if (historyResponse.ok) {
+          const historyPayload = (await historyResponse.json()) as { items?: unknown };
+
+          normalizedClaimHistory = Array.isArray(historyPayload.items)
+            ? historyPayload.items
+                .map((item) => normalizeIncomingClaim(item))
+                .filter((item): item is IncomingClaim => Boolean(item))
+                .slice(0, 20)
+            : [];
+        } else {
+          nextPanelNotice =
+            nextPanelNotice ||
+            (historyResponse.status === 404
+              ? 'History service is not deployed on backend yet.'
+              : 'History is temporarily unavailable.');
+        }
+      }
 
       setPoints(normalizedPoints);
       setLostBoard(normalizedLostItems);
+      setIncomingClaims(normalizedIncomingClaims);
+      setClaimHistory(normalizedClaimHistory);
+      setPanelNotice(nextPanelNotice);
+      setPanelError(nextPanelError);
     } catch (error) {
       const message =
         typeof error === 'object' &&
@@ -358,7 +560,7 @@ export function CampusActionStudio({ onActionsFinished }: CampusActionStudioProp
         'message' in error &&
         typeof (error as { message?: unknown }).message === 'string'
           ? (error as { message: string }).message
-          : 'Unable to load points and lost board.';
+          : 'Unable to load points and home widgets.';
 
       setPanelError(message);
     } finally {
@@ -376,6 +578,7 @@ export function CampusActionStudio({ onActionsFinished }: CampusActionStudioProp
     setTitle('');
     setDescription('');
     setLocationHint('');
+    setSelectedClaimItemId('');
     setActionError('');
     setActionNotice('');
   }, []);
@@ -384,9 +587,14 @@ export function CampusActionStudio({ onActionsFinished }: CampusActionStudioProp
     (nextMode: StudioMode) => {
       setMode(nextMode);
       resetComposer();
+
+      if (nextMode === 'claim' && claimableItems.length) {
+        setSelectedClaimItemId(claimableItems[0].id);
+      }
+
       setIsModalVisible(true);
     },
-    [resetComposer],
+    [claimableItems, resetComposer],
   );
 
   const closeComposer = useCallback(() => {
@@ -590,6 +798,15 @@ export function CampusActionStudio({ onActionsFinished }: CampusActionStudioProp
   ]);
 
   const submitAutoClaim = useCallback(async () => {
+    if (!selectedClaimItemId) {
+      setActionError(
+        claimableItems.length
+          ? 'Select the product you want to claim first.'
+          : 'No claimable products are visible right now.',
+      );
+      return;
+    }
+
     if (!pickedImage) {
       setActionError('Please upload proof image first.');
       return;
@@ -606,7 +823,7 @@ export function CampusActionStudio({ onActionsFinished }: CampusActionStudioProp
         return;
       }
 
-      const payload = await authedJsonRequest('/api/match-requests/auto', {
+      const commonPayload = {
         proof_image_base64: pickedImage.base64,
         mime_type: pickedImage.mimeType,
         width: pickedImage.width,
@@ -618,32 +835,25 @@ export function CampusActionStudio({ onActionsFinished }: CampusActionStudioProp
         lost_description: description.trim(),
         detected_label: ensuredScan.detection.label,
         detected_category: ensuredScan.detection.category,
+      };
+
+      const payload = await authedJsonRequest('/api/match-requests', {
+        ...commonPayload,
+        found_item_id: selectedClaimItemId,
       });
 
-      const matched = Boolean(payload.matched);
+      const matchScore =
+        payload.request && typeof payload.request === 'object'
+          ? safeNumber((payload.request as Record<string, unknown>).match_score)
+          : 0;
+      const pointsAwarded = Math.max(0, safeNumber(payload.pointsAwarded));
+      const targetTitle = selectedClaimItem?.title || 'selected item';
 
-      if (!matched) {
-        const reason = safeString(payload.reason) || 'No strong match yet. Your report is saved.';
-        setActionNotice(reason);
-      } else {
-        const foundItem =
-          payload.foundItem && typeof payload.foundItem === 'object'
-            ? (payload.foundItem as Record<string, unknown>)
-            : null;
-
-        const foundTitle = foundItem ? safeString(foundItem.title) : 'matched item';
-        const matchScore =
-          payload.request && typeof payload.request === 'object'
-            ? safeNumber((payload.request as Record<string, unknown>).match_score)
-            : 0;
-        const pointsAwarded = Math.max(0, safeNumber(payload.pointsAwarded));
-
-        setActionNotice(
-          `Claim submitted for ${foundTitle} (${matchScore}% match). ${
-            pointsAwarded ? `+${pointsAwarded} points added.` : ''
-          }`.trim(),
-        );
-      }
+      setActionNotice(
+        `Claim request sent for ${targetTitle} (${matchScore}% score). Uploader can now review your proof.${
+          pointsAwarded ? ` +${pointsAwarded} points added.` : ''
+        }`,
+      );
 
       await loadPanelData();
       await Promise.resolve(onActionsFinished?.());
@@ -654,7 +864,7 @@ export function CampusActionStudio({ onActionsFinished }: CampusActionStudioProp
         'message' in error &&
         typeof (error as { message?: unknown }).message === 'string'
           ? (error as { message: string }).message
-          : 'Failed to auto-submit claim request.';
+          : 'Failed to submit claim request.';
 
       setActionError(message);
     } finally {
@@ -666,11 +876,106 @@ export function CampusActionStudio({ onActionsFinished }: CampusActionStudioProp
     loadPanelData,
     locationHint,
     onActionsFinished,
+    claimableItems.length,
     pickedImage,
     runScan,
+    selectedClaimItem,
+    selectedClaimItemId,
     scanResult,
     title,
   ]);
+
+  const resolveIncomingClaim = useCallback(
+    async (claimId: string, action: 'approve' | 'reject') => {
+      if (!claimId) {
+        return;
+      }
+
+      setIsResolvingClaimId(claimId);
+      setPanelError('');
+      setPanelNotice('');
+
+      try {
+        const payload = await authedJsonRequest(`/api/match-requests/${claimId}/resolve`, {
+          action,
+        });
+
+        let noticeMessage = '';
+
+        if (action === 'approve') {
+          const finderPoints = Math.max(0, safeNumber(payload.finderPointsAwarded));
+          const claimantPoints = Math.max(0, safeNumber(payload.claimantPointsAwarded));
+
+          noticeMessage =
+            `Claim approved. Finder +${finderPoints} points${
+              claimantPoints ? `, owner +${claimantPoints} points` : ''
+            }.`;
+        } else {
+          noticeMessage = 'Claim request rejected.';
+        }
+
+        await loadPanelData();
+        await Promise.resolve(onActionsFinished?.());
+        setPanelNotice(noticeMessage);
+      } catch (error) {
+        const message =
+          typeof error === 'object' &&
+          error !== null &&
+          'message' in error &&
+          typeof (error as { message?: unknown }).message === 'string'
+            ? (error as { message: string }).message
+            : 'Failed to resolve claim request.';
+
+        setPanelError(message);
+      } finally {
+        setIsResolvingClaimId('');
+      }
+    },
+    [authedJsonRequest, loadPanelData, onActionsFinished],
+  );
+
+  const confirmPickup = useCallback(
+    async (claimId: string) => {
+      if (!claimId) {
+        return;
+      }
+
+      setIsConfirmingPickupId(claimId);
+      setPanelError('');
+      setPanelNotice('');
+
+      try {
+        const payload = await authedJsonRequest(`/api/match-requests/${claimId}/confirm-pickup`, {});
+
+        const finderPoints = Math.max(0, safeNumber(payload.finderPickupPoints));
+        const claimantPoints = Math.max(0, safeNumber(payload.claimantPickupPoints));
+
+        await loadPanelData();
+        await Promise.resolve(onActionsFinished?.());
+
+        setPanelNotice(
+          `Pickup confirmed. Finder +${finderPoints} points${
+            claimantPoints ? `, owner +${claimantPoints} points` : ''
+          }. History updated for both users.`,
+        );
+      } catch (error) {
+        const message =
+          typeof error === 'object' &&
+          error !== null &&
+          'message' in error &&
+          typeof (error as { message?: unknown }).message === 'string'
+            ? (error as { message: string }).message
+            : 'Failed to confirm pickup.';
+
+        setPanelError(message);
+      } finally {
+        setIsConfirmingPickupId('');
+      }
+    },
+    [authedJsonRequest, loadPanelData, onActionsFinished],
+  );
+
+  const isClaimSubmitBlocked = mode === 'claim' && !selectedClaimItemId;
 
   return (
     <View style={styles.root}>
@@ -714,6 +1019,25 @@ export function CampusActionStudio({ onActionsFinished }: CampusActionStudioProp
         ) : null}
       </View>
 
+      <View style={compact ? styles.quickWidgetsRowCompact : styles.quickWidgetsRow}>
+        <View style={styles.quickWidgetCard}>
+          <Text style={styles.quickWidgetLabel}>Open Lost</Text>
+          <Text style={styles.quickWidgetValue}>{quickWidgetMetrics.openLostCount}</Text>
+        </View>
+
+        <View style={styles.quickWidgetCard}>
+          <Text style={styles.quickWidgetLabel}>Pending Claims</Text>
+          <Text style={styles.quickWidgetValue}>{quickWidgetMetrics.pendingClaimsCount}</Text>
+        </View>
+
+        {!compact ? (
+          <View style={styles.quickWidgetCard}>
+            <Text style={styles.quickWidgetLabel}>Recent Rewards</Text>
+            <Text style={styles.quickWidgetValue}>{quickWidgetMetrics.recentRewards}</Text>
+          </View>
+        ) : null}
+      </View>
+
       <View style={styles.studioCard}>
         <Text style={styles.studioTitle}>Campus AI Studio</Text>
         <Text style={styles.studioSubtitle}>
@@ -738,10 +1062,134 @@ export function CampusActionStudio({ onActionsFinished }: CampusActionStudioProp
             <Text style={styles.errorText}>{panelError}</Text>
           </View>
         ) : null}
+
+        {panelNotice ? (
+          <View style={styles.noticeWrap}>
+            <MaterialIcons color={colors.success} name="check-circle" size={15} />
+            <Text style={styles.noticeText}>{panelNotice}</Text>
+          </View>
+        ) : null}
       </View>
 
       <View style={styles.boardHeader}>
-        <Text style={styles.boardTitle}>Lost Board</Text>
+        <Text style={styles.boardTitle}>Claim Inbox</Text>
+      </View>
+
+      {incomingClaims.length ? (
+        incomingClaims.slice(0, compact ? 1 : 3).map((claim) => (
+          <View key={claim.id} style={styles.claimCard}>
+            <View style={styles.claimHeaderRow}>
+              <Text numberOfLines={1} style={styles.claimTitle}>
+                {claim.found_item.title}
+              </Text>
+              <Text style={styles.claimScore}>{claim.match_score}% match</Text>
+            </View>
+
+            <Text numberOfLines={1} style={styles.claimMetaText}>
+              Requested by owner {formatRelativeTime(claim.created_at)}
+            </Text>
+
+            {claim.proof_image_url ? (
+              <Image source={{ uri: claim.proof_image_url }} style={styles.claimProofImage} />
+            ) : null}
+
+            <Text numberOfLines={1} style={styles.claimMetaSubText}>
+              Proof label: {claim.ai_detected_label || 'Manual proof'}
+            </Text>
+
+            <View style={styles.claimActionRow}>
+              <Pressable
+                disabled={Boolean(isResolvingClaimId)}
+                onPress={() => void resolveIncomingClaim(claim.id, 'reject')}
+                style={styles.rejectButton}
+              >
+                <Text style={styles.rejectButtonText}>Reject</Text>
+              </Pressable>
+
+              <Pressable
+                disabled={Boolean(isResolvingClaimId)}
+                onPress={() => void resolveIncomingClaim(claim.id, 'approve')}
+                style={styles.approveButton}
+              >
+                {isResolvingClaimId === claim.id ? (
+                  <ActivityIndicator color={colors.onPrimary} size="small" />
+                ) : (
+                  <Text style={styles.approveButtonText}>Approve + Points</Text>
+                )}
+              </Pressable>
+            </View>
+          </View>
+        ))
+      ) : (
+        <View style={styles.emptyBoardCard}>
+          <MaterialIcons color={colors.outline} name="inbox" size={18} />
+          <Text style={styles.emptyBoardText}>No incoming claims to review.</Text>
+        </View>
+      )}
+
+      {pickupQueue.length ? (
+        <>
+          <View style={styles.boardHeader}>
+            <Text style={styles.boardTitle}>Pickup Confirmation</Text>
+          </View>
+
+          {pickupQueue.map((claim) => (
+            <View key={`pickup-${claim.id}`} style={styles.claimCard}>
+              <View style={styles.claimHeaderRow}>
+                <Text numberOfLines={1} style={styles.claimTitle}>
+                  {claim.found_item.title}
+                </Text>
+                <Text style={styles.claimScore}>Approved</Text>
+              </View>
+
+              <Text numberOfLines={1} style={styles.claimMetaText}>
+                Owner verified. Mark picked up after handover.
+              </Text>
+
+              <Pressable
+                disabled={Boolean(isConfirmingPickupId)}
+                onPress={() => void confirmPickup(claim.id)}
+                style={styles.pickupButton}
+              >
+                {isConfirmingPickupId === claim.id ? (
+                  <ActivityIndicator color={colors.onPrimary} size="small" />
+                ) : (
+                  <Text style={styles.pickupButtonText}>Mark Picked Up</Text>
+                )}
+              </Pressable>
+            </View>
+          ))}
+        </>
+      ) : null}
+
+      <View style={styles.boardHeader}>
+        <Text style={styles.boardTitle}>Claim History</Text>
+      </View>
+
+      {claimHistory.length ? (
+        claimHistory.slice(0, compact ? 2 : 5).map((entry) => (
+          <View key={`history-${entry.id}`} style={styles.historyCard}>
+            <View style={styles.historyTopRow}>
+              <Text numberOfLines={1} style={styles.historyTitle}>
+                {entry.found_item.title}
+              </Text>
+              <Text style={styles.historyStatus}>{entry.status.replace('_', ' ')}</Text>
+            </View>
+
+            <Text numberOfLines={1} style={styles.historyMeta}>
+              Score {entry.match_score}% • {formatRelativeTime(entry.created_at)}
+            </Text>
+          </View>
+        ))
+      ) : (
+        <View style={styles.emptyBoardCard}>
+          <MaterialIcons color={colors.outline} name="history" size={18} />
+          <Text style={styles.emptyBoardText}>No claim history yet.</Text>
+        </View>
+      )}
+
+      <View style={styles.boardHeader}>
+        <Text style={styles.boardTitle}>{compact ? 'Recent Lost Reports' : 'Lost Board'}</Text>
         {isPanelLoading ? (
           <ActivityIndicator color={colors.primary} size="small" />
         ) : (
@@ -753,7 +1201,7 @@ export function CampusActionStudio({ onActionsFinished }: CampusActionStudioProp
 
       {lostBoard.length ? (
         <ScrollView horizontal showsHorizontalScrollIndicator={false}>
-          {lostBoard.map((item) => (
+          {lostBoard.slice(0, compact ? 4 : 12).map((item) => (
             <View key={item.id} style={styles.boardCard}>
               {item.image_url ? (
                 <Image source={{ uri: item.image_url }} style={styles.boardImage} />
@@ -790,7 +1238,7 @@ export function CampusActionStudio({ onActionsFinished }: CampusActionStudioProp
           <View style={styles.modalSheet}>
             <View style={styles.modalHeader}>
               <Text style={styles.modalTitle}>
-                {mode === 'lost' ? 'Report Lost Product' : 'Proof Match Request'}
+                {mode === 'lost' ? 'Report Lost Product' : 'Claim Product With Proof'}
               </Text>
               <Pressable onPress={closeComposer}>
                 <MaterialIcons color={colors.onSurfaceVariant} name="close" size={24} />
@@ -798,6 +1246,67 @@ export function CampusActionStudio({ onActionsFinished }: CampusActionStudioProp
             </View>
 
             <ScrollView showsVerticalScrollIndicator={false}>
+              {mode === 'claim' ? (
+                <>
+                  <Text style={styles.inputLabel}>Select Found Product</Text>
+
+                  {claimableItems.length ? (
+                    <ScrollView
+                      contentContainerStyle={styles.claimTargetList}
+                      horizontal
+                      showsHorizontalScrollIndicator={false}
+                    >
+                      {claimableItems.slice(0, 30).map((item) => {
+                        const active = item.id === selectedClaimItemId;
+
+                        return (
+                          <Pressable
+                            key={item.id}
+                            onPress={() => setSelectedClaimItemId(item.id)}
+                            style={[
+                              styles.claimTargetChip,
+                              active ? styles.claimTargetChipActive : undefined,
+                            ]}
+                          >
+                            <Text
+                              numberOfLines={1}
+                              style={[
+                                styles.claimTargetTitle,
+                                active ? styles.claimTargetTitleActive : undefined,
+                              ]}
+                            >
+                              {item.title}
+                            </Text>
+                            <Text
+                              numberOfLines={1}
+                              style={[
+                                styles.claimTargetMeta,
+                                active ? styles.claimTargetMetaActive : undefined,
+                              ]}
+                            >
+                              {item.location}
+                            </Text>
+                          </Pressable>
+                        );
+                      })}
+                    </ScrollView>
+                  ) : (
+                    <View style={styles.emptySelectionCard}>
+                      <MaterialIcons color={colors.outline} name="inventory" size={17} />
+                      <Text style={styles.emptySelectionText}>
+                        No public found products are available to claim.
+                      </Text>
+                    </View>
+                  )}
+
+                  {selectedClaimItem ? (
+                    <Text numberOfLines={2} style={styles.selectedTargetHint}>
+                      Claiming: {selectedClaimItem.title} • {selectedClaimItem.location}
+                    </Text>
+                  ) : null}
+                </>
+              ) : null}
+
               <View style={styles.imagePickerWrap}>
                 {pickedImage ? (
                   <Image source={{ uri: pickedImage.uri }} style={styles.previewImage} />
@@ -883,9 +1392,12 @@ export function CampusActionStudio({ onActionsFinished }: CampusActionStudioProp
               ) : null}
 
               <Pressable
-                disabled={isWorking}
+                disabled={isWorking || isClaimSubmitBlocked}
                 onPress={() => void (mode === 'lost' ? submitLostReport() : submitAutoClaim())}
-                style={[styles.submitButton, isWorking ? styles.submitButtonDisabled : undefined]}
+                style={[
+                  styles.submitButton,
+                  isWorking || isClaimSubmitBlocked ? styles.submitButtonDisabled : undefined,
+                ]}
               >
                 {isWorking ? (
                   <ActivityIndicator color={colors.onPrimary} size="small" />
@@ -899,7 +1411,7 @@ export function CampusActionStudio({ onActionsFinished }: CampusActionStudioProp
                     <Text style={styles.submitButtonText}>
                       {mode === 'lost'
                         ? 'Submit Lost Product'
-                        : 'Auto Match and Submit Claim'}
+                        : 'Submit Claim Request'}
                     </Text>
                   </>
                 )}
@@ -997,6 +1509,37 @@ const styles = StyleSheet.create({
   activityPointsGain: {
     color: '#145A36',
   },
+  quickWidgetsRow: {
+    flexDirection: 'row',
+    marginBottom: 12,
+  },
+  quickWidgetsRowCompact: {
+    flexDirection: 'row',
+    marginBottom: 10,
+  },
+  quickWidgetCard: {
+    backgroundColor: colors.surface,
+    borderColor: 'rgba(118, 118, 131, 0.18)',
+    borderRadius: radii.md,
+    borderWidth: 1,
+    flex: 1,
+    marginRight: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 10,
+  },
+  quickWidgetLabel: {
+    color: colors.onSurfaceVariant,
+    fontFamily: fontFamily.bodySemiBold,
+    fontSize: 10,
+    letterSpacing: 0.7,
+    textTransform: 'uppercase',
+  },
+  quickWidgetValue: {
+    color: colors.primary,
+    fontFamily: fontFamily.headlineBold,
+    fontSize: 22,
+    marginTop: 4,
+  },
   studioCard: {
     ...shadows.soft,
     backgroundColor: '#EDF6FF',
@@ -1070,6 +1613,129 @@ const styles = StyleSheet.create({
     fontSize: 11,
     letterSpacing: 0.8,
     textTransform: 'uppercase',
+  },
+  claimCard: {
+    backgroundColor: colors.surface,
+    borderColor: 'rgba(118, 118, 131, 0.18)',
+    borderRadius: radii.md,
+    borderWidth: 1,
+    marginBottom: 8,
+    padding: 10,
+  },
+  claimHeaderRow: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+  },
+  claimTitle: {
+    color: colors.onSurface,
+    flex: 1,
+    fontFamily: fontFamily.headlineSemiBold,
+    fontSize: 14,
+    marginRight: 6,
+  },
+  claimScore: {
+    color: colors.primary,
+    fontFamily: fontFamily.bodySemiBold,
+    fontSize: 11,
+    textTransform: 'uppercase',
+  },
+  claimMetaText: {
+    color: colors.onSurfaceVariant,
+    fontFamily: fontFamily.bodyMedium,
+    fontSize: 12,
+    marginTop: 5,
+  },
+  claimMetaSubText: {
+    color: colors.outline,
+    fontFamily: fontFamily.bodyMedium,
+    fontSize: 11,
+    marginTop: 5,
+  },
+  claimProofImage: {
+    borderRadius: 10,
+    height: 124,
+    marginTop: 8,
+    width: '100%',
+  },
+  claimActionRow: {
+    flexDirection: 'row',
+    justifyContent: 'flex-end',
+    marginTop: 9,
+  },
+  rejectButton: {
+    alignItems: 'center',
+    backgroundColor: '#F0F2F4',
+    borderRadius: radii.pill,
+    justifyContent: 'center',
+    marginRight: 8,
+    minWidth: 84,
+    paddingVertical: 8,
+  },
+  rejectButtonText: {
+    color: colors.onSurfaceVariant,
+    fontFamily: fontFamily.bodySemiBold,
+    fontSize: 12,
+  },
+  approveButton: {
+    alignItems: 'center',
+    backgroundColor: colors.primary,
+    borderRadius: radii.pill,
+    justifyContent: 'center',
+    minWidth: 136,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+  },
+  approveButtonText: {
+    color: colors.onPrimary,
+    fontFamily: fontFamily.bodySemiBold,
+    fontSize: 12,
+  },
+  pickupButton: {
+    alignItems: 'center',
+    backgroundColor: colors.primary,
+    borderRadius: radii.pill,
+    justifyContent: 'center',
+    marginTop: 10,
+    minHeight: 36,
+    paddingHorizontal: 10,
+  },
+  pickupButtonText: {
+    color: colors.onPrimary,
+    fontFamily: fontFamily.bodySemiBold,
+    fontSize: 12,
+  },
+  historyCard: {
+    backgroundColor: colors.surface,
+    borderColor: 'rgba(118, 118, 131, 0.16)',
+    borderRadius: radii.md,
+    borderWidth: 1,
+    marginBottom: 8,
+    padding: 10,
+  },
+  historyTopRow: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+  },
+  historyTitle: {
+    color: colors.onSurface,
+    flex: 1,
+    fontFamily: fontFamily.headlineSemiBold,
+    fontSize: 13,
+    marginRight: 8,
+  },
+  historyStatus: {
+    color: colors.primary,
+    fontFamily: fontFamily.bodySemiBold,
+    fontSize: 10,
+    textTransform: 'uppercase',
+  },
+  historyMeta: {
+    color: colors.onSurfaceVariant,
+    fontFamily: fontFamily.bodyMedium,
+    fontSize: 11,
+    marginTop: 4,
   },
   boardCard: {
     backgroundColor: colors.surface,
@@ -1167,6 +1833,66 @@ const styles = StyleSheet.create({
     color: colors.primary,
     fontFamily: fontFamily.headlineBold,
     fontSize: 20,
+  },
+  claimTargetList: {
+    paddingBottom: 2,
+    paddingRight: 6,
+  },
+  claimTargetChip: {
+    backgroundColor: colors.surface,
+    borderColor: 'rgba(118, 118, 131, 0.2)',
+    borderRadius: radii.md,
+    borderWidth: 1,
+    marginRight: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 9,
+    width: 170,
+  },
+  claimTargetChipActive: {
+    backgroundColor: '#E8EEFF',
+    borderColor: '#A9BCF2',
+  },
+  claimTargetTitle: {
+    color: colors.onSurface,
+    fontFamily: fontFamily.headlineSemiBold,
+    fontSize: 12,
+  },
+  claimTargetTitleActive: {
+    color: colors.primary,
+  },
+  claimTargetMeta: {
+    color: colors.onSurfaceVariant,
+    fontFamily: fontFamily.bodyMedium,
+    fontSize: 11,
+    marginTop: 3,
+  },
+  claimTargetMetaActive: {
+    color: colors.primary,
+  },
+  selectedTargetHint: {
+    color: colors.onSurfaceVariant,
+    fontFamily: fontFamily.bodyMedium,
+    fontSize: 12,
+    marginBottom: 4,
+    marginTop: 8,
+  },
+  emptySelectionCard: {
+    alignItems: 'center',
+    backgroundColor: colors.surface,
+    borderColor: 'rgba(118, 118, 131, 0.2)',
+    borderRadius: radii.md,
+    borderWidth: 1,
+    flexDirection: 'row',
+    marginBottom: 4,
+    paddingHorizontal: 10,
+    paddingVertical: 10,
+  },
+  emptySelectionText: {
+    color: colors.onSurfaceVariant,
+    flex: 1,
+    fontFamily: fontFamily.bodyMedium,
+    fontSize: 12,
+    marginLeft: 6,
   },
   imagePickerWrap: {
     alignItems: 'center',

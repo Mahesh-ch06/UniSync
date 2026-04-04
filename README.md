@@ -17,6 +17,9 @@
 - Lost board feed (`/api/lost-items`)
 - Camera/gallery scan with item-type detection (`/api/vision/classify-item`)
 - Auto match claim submission with proof image (`/api/match-requests/auto`)
+- Incoming claim inbox for finders (`/api/match-requests/inbox`)
+- Claim approval or rejection by finder (`/api/match-requests/:requestId/resolve`)
+- Finder points awarded when owner claim is approved
 
 ## Render Backend Setup
 
