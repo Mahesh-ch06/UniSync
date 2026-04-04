@@ -1,3 +1,4 @@
+import { useAuth } from '@clerk/clerk-expo';
 import { MaterialIcons } from '@expo/vector-icons';
 import { useMemo, useState } from 'react';
 import { Image, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
@@ -7,8 +8,24 @@ import { AppTopBar } from '../components/AppTopBar';
 import { colors, fontFamily, radii, shadows } from '../theme/tokens';
 
 export function ProfileScreen() {
+  const { signOut } = useAuth();
   const [answer, setAnswer] = useState('');
+  const [isSigningOut, setIsSigningOut] = useState(false);
   const canSubmit = useMemo(() => answer.trim().length > 2, [answer]);
+
+  const handleSignOut = async () => {
+    if (isSigningOut) {
+      return;
+    }
+
+    setIsSigningOut(true);
+
+    try {
+      await signOut();
+    } finally {
+      setIsSigningOut(false);
+    }
+  };
 
   return (
     <SafeAreaView edges={['top']} style={styles.safeArea}>
@@ -61,6 +78,14 @@ export function ProfileScreen() {
           <Text style={[styles.proofText, !canSubmit ? styles.proofTextDisabled : undefined]}>
             Submit Proof of Ownership
           </Text>
+        </Pressable>
+
+        <Pressable
+          onPress={handleSignOut}
+          style={[styles.signOutButton, isSigningOut ? styles.signOutButtonDisabled : undefined]}
+        >
+          <MaterialIcons color={colors.primary} name="logout" size={18} />
+          <Text style={styles.signOutText}>{isSigningOut ? 'Signing out...' : 'Sign out'}</Text>
         </Pressable>
 
         <View style={styles.encryptedRow}>
@@ -205,6 +230,25 @@ const styles = StyleSheet.create({
   },
   proofTextDisabled: {
     color: colors.outline,
+  },
+  signOutButton: {
+    alignItems: 'center',
+    alignSelf: 'center',
+    backgroundColor: 'rgba(0, 6, 102, 0.08)',
+    borderRadius: radii.pill,
+    flexDirection: 'row',
+    marginBottom: 10,
+    paddingHorizontal: 14,
+    paddingVertical: 9,
+  },
+  signOutButtonDisabled: {
+    opacity: 0.7,
+  },
+  signOutText: {
+    color: colors.primary,
+    fontFamily: fontFamily.bodySemiBold,
+    fontSize: 13,
+    marginLeft: 6,
   },
   encryptedRow: {
     alignItems: 'center',

@@ -1,8 +1,21 @@
 import { MaterialIcons } from '@expo/vector-icons';
-import { Image, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
+import { useAuth } from '@clerk/clerk-expo';
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import {
+  ActivityIndicator,
+  Image,
+  Pressable,
+  ScrollView,
+  StyleSheet,
+  Text,
+  TextInput,
+  View,
+} from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { AppTopBar } from '../components/AppTopBar';
+import { backendEnv } from '../config/env';
+import { buildSupabaseClient } from '../lib/supabase';
 import { colors, fontFamily, radii, shadows } from '../theme/tokens';
 
 type FoundItem = {
@@ -11,44 +24,92 @@ type FoundItem = {
   location: string;
   foundAgo: string;
   category: string;
-  imageUri: string;
+  imageUri: string | null;
   categoryTone: 'primary' | 'secondary' | 'neutral';
 };
 
-const categories = ['All Items', 'Electronics', 'Clothing', 'Keys', 'Wallets'];
+function readText(value: unknown): string | null {
+  if (typeof value !== 'string') {
+    return null;
+  }
 
-const foundItems: FoundItem[] = [
-  {
-    id: '1',
-    title: 'Sony WH-1000XM4',
-    location: 'Main Library, Level 3',
-    foundAgo: 'Found 2h ago',
-    category: 'Electronics',
-    imageUri:
-      'https://lh3.googleusercontent.com/aida-public/AB6AXuCYH1dwbddvlvCeWLYLCw5ibWLhVVIwTE59sDdMhkYnmHUiJegCYo6twtr3sM0rKNbhCEuU2fxFK98HmByraE_6BnTvbjVFIGFvC55HWarbT2B3ZSJ9ZRuNwsUOxj7oX6tvHUGgP9XQtoMsEtr0-c8K7O94baDc_IeD4s9wniekOZWbURrzN-DbN-zHD4az86az4JUbkP1uWEy6xFVLa5P77xIdP-THwROEvPyOffrujqsljfN8mq9zCoM5J1Uoc1rE1_DELz91hnur',
-    categoryTone: 'primary',
-  },
-  {
-    id: '2',
-    title: 'Keys & Blue Lanyard',
-    location: 'Student Union Plaza',
-    foundAgo: 'Found 4h ago',
-    category: 'Keys',
-    imageUri:
-      'https://lh3.googleusercontent.com/aida-public/AB6AXuAm_OP6CNbVyEbxkf6KEitL3yOPLz_vPSNI7KSR_iyqLK-kJjCxtRCt1Wn1QgW0wpdq-bXlhot9W_ZxQBRvKUsChxLjlVTavYO3CHbQ6xoCIrYwL5IpawS0r6aJK6v2031WhpW9qrgb4eDHtBF9WqPCxwqtmzFVOGDUb-iZYQMBpFb_Vb_u8cFRo5wQT1eGYzpdsLLGQbzUmFrP3sLCebuS9QtdaRWrKs6pourApmcdpzCGmwtkFGXMPUhpnxOrvqxt8JuVSNjhtr0q',
-    categoryTone: 'secondary',
-  },
-  {
-    id: '3',
-    title: 'Denim Jacket (M)',
-    location: 'Engineering Hall B1',
-    foundAgo: 'Found 6h ago',
-    category: 'Clothing',
-    imageUri:
-      'https://lh3.googleusercontent.com/aida-public/AB6AXuDolcE243MQcUlZd1_N6DYAPZ75VppLbWkTUvdsqaV5XrGT_KkGgdoVlKalTxLE6Qd_qoICgMuvXxQYGzfrpb4u0FLFW_9eXypWZYnT4A92TX2ixPmuE8U6T2EBVrA1WrBV86MyurOmpC_vEa73z1gCfKcuSvNSC3Uzxh686WFRYFq1mhQFL8Sj832vGH_q6n-q5HD9X2hhRNmnWXSuJqqPdtREOf1ucnK1MgZuFnXHnH2PKtQom9Ypkhj_55IXqeHUZYFEGU5POYwu',
-    categoryTone: 'neutral',
-  },
-];
+  const trimmed = value.trim();
+  return trimmed.length ? trimmed : null;
+}
+
+function readIdentifier(value: unknown): string | null {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return String(value);
+  }
+
+  return readText(value);
+}
+
+function resolveCategoryTone(category: string): FoundItem['categoryTone'] {
+  const lowered = category.toLowerCase();
+
+  if (lowered.includes('electronic') || lowered.includes('device')) {
+    return 'primary';
+  }
+
+  if (lowered.includes('key') || lowered.includes('wallet')) {
+    return 'secondary';
+  }
+
+  return 'neutral';
+}
+
+function formatFoundAgo(input: string | null): string {
+  if (!input) {
+    return 'Found recently';
+  }
+
+  const timestamp = new Date(input).getTime();
+  if (Number.isNaN(timestamp)) {
+    return 'Found recently';
+  }
+
+  const diffMs = Math.max(Date.now() - timestamp, 0);
+  const diffHours = Math.floor(diffMs / (1000 * 60 * 60));
+
+  if (diffHours < 1) {
+    const diffMinutes = Math.max(Math.floor(diffMs / (1000 * 60)), 1);
+    return `Found ${diffMinutes}m ago`;
+  }
+
+  if (diffHours < 24) {
+    return `Found ${diffHours}h ago`;
+  }
+
+  const diffDays = Math.floor(diffHours / 24);
+  return `Found ${diffDays}d ago`;
+}
+
+function mapRowToItem(row: Record<string, unknown>): FoundItem {
+  const title = readText(row.title) ?? readText(row.name) ?? 'Unnamed item';
+  const location =
+    readText(row.location) ??
+    readText(row.location_name) ??
+    readText(row.found_location) ??
+    'Campus location';
+  const category = readText(row.category) ?? readText(row.category_name) ?? 'General';
+  const imageUri =
+    readText(row.image_url) ?? readText(row.photo_url) ?? readText(row.image) ?? null;
+  const createdAt =
+    readText(row.created_at) ?? readText(row.found_at) ?? readText(row.inserted_at) ?? null;
+
+  return {
+    id:
+      readIdentifier(row.id) ??
+      `${title}-${location}-${createdAt ?? Math.random().toString(36).slice(2)}`,
+    title,
+    location,
+    foundAgo: formatFoundAgo(createdAt),
+    category,
+    imageUri,
+    categoryTone: resolveCategoryTone(category),
+  };
+}
 
 function categoryPillStyle(tone: FoundItem['categoryTone']) {
   if (tone === 'primary') {
@@ -76,7 +137,13 @@ function FoundItemCard({ item }: { item: FoundItem }) {
 
   return (
     <View style={styles.card}>
-      <Image source={{ uri: item.imageUri }} style={styles.cardImage} />
+      {item.imageUri ? (
+        <Image source={{ uri: item.imageUri }} style={styles.cardImage} />
+      ) : (
+        <View style={styles.cardImageFallback}>
+          <MaterialIcons color={colors.outline} name="photo" size={28} />
+        </View>
+      )}
       <View style={styles.cardContent}>
         <View>
           <View style={styles.cardHeader}>
@@ -106,6 +173,98 @@ function FoundItemCard({ item }: { item: FoundItem }) {
 }
 
 export function HomeScreen() {
+  const { getToken } = useAuth();
+  const [allItems, setAllItems] = useState<FoundItem[]>([]);
+  const [selectedCategory, setSelectedCategory] = useState('All Items');
+  const [searchText, setSearchText] = useState('');
+  const [isLoading, setIsLoading] = useState(true);
+  const [errorText, setErrorText] = useState('');
+
+  const categories = useMemo(() => {
+    const uniqueCategories = Array.from(new Set(allItems.map((item) => item.category))).sort();
+    return ['All Items', ...uniqueCategories];
+  }, [allItems]);
+
+  const visibleItems = useMemo(() => {
+    const normalizedSearch = searchText.trim().toLowerCase();
+
+    return allItems.filter((item) => {
+      const categoryPass =
+        selectedCategory === 'All Items' || item.category === selectedCategory;
+      const searchPass =
+        !normalizedSearch ||
+        item.title.toLowerCase().includes(normalizedSearch) ||
+        item.location.toLowerCase().includes(normalizedSearch) ||
+        item.category.toLowerCase().includes(normalizedSearch);
+
+      return categoryPass && searchPass;
+    });
+  }, [allItems, searchText, selectedCategory]);
+
+  const loadItems = useCallback(async () => {
+    setErrorText('');
+    setIsLoading(true);
+
+    try {
+      const backendBaseUrl = backendEnv.backendUrl.replace(/\/+$/, '');
+
+      if (backendBaseUrl) {
+        const response = await fetch(`${backendBaseUrl}/api/found-items`);
+
+        if (!response.ok) {
+          throw new Error(`Render backend request failed with ${response.status}`);
+        }
+
+        const payload = (await response.json()) as { items?: Record<string, unknown>[] };
+        const mappedFromBackend = (payload.items ?? []).map((row) =>
+          mapRowToItem(row as Record<string, unknown>),
+        );
+
+        setAllItems(mappedFromBackend);
+        return;
+      }
+
+      const accessToken = await getToken({ template: 'supabase' }).catch(() => null);
+      const client = buildSupabaseClient(accessToken ?? undefined);
+
+      if (!client) {
+        setErrorText('Supabase is not configured yet. Add keys in your .env file.');
+        setAllItems([]);
+        return;
+      }
+
+      const { data, error } = await client
+        .from('found_items')
+        .select('*')
+        .order('created_at', { ascending: false })
+        .limit(40);
+
+      if (error) {
+        throw error;
+      }
+
+      const mapped = (data ?? []).map((row) => mapRowToItem(row as Record<string, unknown>));
+      setAllItems(mapped);
+    } catch (error) {
+      const message =
+        typeof error === 'object' &&
+        error !== null &&
+        'message' in error &&
+        typeof (error as { message?: unknown }).message === 'string'
+          ? (error as { message: string }).message
+          : 'Failed to load items from Supabase.';
+
+      setErrorText(message);
+      setAllItems([]);
+    } finally {
+      setIsLoading(false);
+    }
+  }, [getToken]);
+
+  useEffect(() => {
+    void loadItems();
+  }, [loadItems]);
+
   return (
     <SafeAreaView edges={['top']} style={styles.safeArea}>
       <AppTopBar leftIcon="menu" title="CampusFind" />
@@ -118,7 +277,13 @@ export function HomeScreen() {
 
         <View style={styles.searchShell}>
           <MaterialIcons color={colors.outline} name="search" size={20} style={styles.searchIcon} />
-          <TextInput placeholder="Search for items..." placeholderTextColor={colors.outline} style={styles.searchInput} />
+          <TextInput
+            onChangeText={setSearchText}
+            placeholder="Search for items..."
+            placeholderTextColor={colors.outline}
+            style={styles.searchInput}
+            value={searchText}
+          />
         </View>
 
         <ScrollView
@@ -127,11 +292,12 @@ export function HomeScreen() {
           showsHorizontalScrollIndicator={false}
           style={styles.chipsWrap}
         >
-          {categories.map((chip, index) => {
-            const active = index === 0;
+          {categories.map((chip) => {
+            const active = chip === selectedCategory;
             return (
               <Pressable
                 key={chip}
+                onPress={() => setSelectedCategory(chip)}
                 style={[styles.filterChip, active ? styles.filterChipActive : styles.filterChipMuted]}
               >
                 <Text style={[styles.filterChipText, active ? styles.filterChipTextActive : undefined]}>
@@ -144,12 +310,34 @@ export function HomeScreen() {
 
         <View style={styles.feedHeader}>
           <Text style={styles.feedTitle}>Recently Found Items</Text>
-          <Text style={styles.feedCount}>24 New Today</Text>
+          <Text style={styles.feedCount}>{visibleItems.length} Live</Text>
         </View>
 
-        {foundItems.map((item) => (
-          <FoundItemCard item={item} key={item.id} />
-        ))}
+        {isLoading ? (
+          <View style={styles.loadingWrap}>
+            <ActivityIndicator color={colors.primary} size="large" />
+            <Text style={styles.loadingText}>Loading items from Supabase...</Text>
+          </View>
+        ) : errorText ? (
+          <View style={styles.emptyStateCard}>
+            <MaterialIcons color={colors.error} name="error-outline" size={24} />
+            <Text style={styles.emptyStateTitle}>Could not load items</Text>
+            <Text style={styles.emptyStateSubtitle}>{errorText}</Text>
+            <Pressable onPress={() => void loadItems()} style={styles.retryButton}>
+              <Text style={styles.retryText}>Try again</Text>
+            </Pressable>
+          </View>
+        ) : visibleItems.length === 0 ? (
+          <View style={styles.emptyStateCard}>
+            <MaterialIcons color={colors.outline} name="inventory-2" size={24} />
+            <Text style={styles.emptyStateTitle}>No items yet</Text>
+            <Text style={styles.emptyStateSubtitle}>
+              Add rows to your found_items table in Supabase to populate this feed.
+            </Text>
+          </View>
+        ) : (
+          visibleItems.map((item) => <FoundItemCard item={item} key={item.id} />)
+        )}
       </ScrollView>
     </SafeAreaView>
   );
@@ -256,6 +444,13 @@ const styles = StyleSheet.create({
     height: 150,
     width: 112,
   },
+  cardImageFallback: {
+    alignItems: 'center',
+    backgroundColor: colors.surfaceLow,
+    height: 150,
+    justifyContent: 'center',
+    width: 112,
+  },
   cardContent: {
     flex: 1,
     justifyContent: 'space-between',
@@ -318,5 +513,48 @@ const styles = StyleSheet.create({
     fontFamily: fontFamily.bodySemiBold,
     fontSize: 11,
     marginLeft: 4,
+  },
+  loadingWrap: {
+    alignItems: 'center',
+    paddingVertical: 30,
+  },
+  loadingText: {
+    color: colors.onSurfaceVariant,
+    fontFamily: fontFamily.bodyMedium,
+    marginTop: 10,
+  },
+  emptyStateCard: {
+    alignItems: 'center',
+    backgroundColor: colors.surface,
+    borderColor: 'rgba(118, 118, 131, 0.16)',
+    borderRadius: radii.lg,
+    borderWidth: 1,
+    padding: 20,
+  },
+  emptyStateTitle: {
+    color: colors.onSurface,
+    fontFamily: fontFamily.headlineBold,
+    fontSize: 18,
+    marginTop: 8,
+  },
+  emptyStateSubtitle: {
+    color: colors.onSurfaceVariant,
+    fontFamily: fontFamily.bodyMedium,
+    fontSize: 13,
+    lineHeight: 20,
+    marginTop: 6,
+    textAlign: 'center',
+  },
+  retryButton: {
+    backgroundColor: colors.primary,
+    borderRadius: radii.pill,
+    marginTop: 12,
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+  },
+  retryText: {
+    color: colors.onPrimary,
+    fontFamily: fontFamily.bodySemiBold,
+    fontSize: 12,
   },
 });

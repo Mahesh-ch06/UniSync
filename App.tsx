@@ -1,3 +1,12 @@
+import {
+  ClerkLoaded,
+  ClerkLoading,
+  ClerkProvider,
+  SignedIn,
+  SignedOut,
+  useUser,
+} from '@clerk/clerk-expo';
+import { tokenCache } from '@clerk/clerk-expo/token-cache';
 import { MaterialIcons } from '@expo/vector-icons';
 import {
   Inter_400Regular,
@@ -16,10 +25,14 @@ import { StatusBar } from 'expo-status-bar';
 import { ActivityIndicator, StyleSheet, Text, View } from 'react-native';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 
+import { backendEnv, isBackendConfigured, missingEnvKeys } from './src/config/env';
+import { AuthScreen } from './src/screens/AuthScreen';
 import { HomeScreen } from './src/screens/HomeScreen';
 import { MapScreen } from './src/screens/MapScreen';
 import { ProfileScreen } from './src/screens/ProfileScreen';
 import { ReportScreen } from './src/screens/ReportScreen';
+import { CompleteNameScreen } from './src/screens/CompleteNameScreen';
+import { SetupScreen } from './src/screens/SetupScreen';
 import { colors, fontFamily } from './src/theme/tokens';
 
 type RootTabsParamList = {
@@ -103,6 +116,27 @@ function AppTabs() {
   );
 }
 
+function SignedInGate() {
+  const { isLoaded, user } = useUser();
+
+  if (!isLoaded) {
+    return (
+      <View style={styles.loaderWrap}>
+        <ActivityIndicator color={colors.primary} size="large" />
+        <Text style={styles.loaderText}>Loading profile...</Text>
+      </View>
+    );
+  }
+
+  const hasName = Boolean(user?.firstName?.trim() || user?.lastName?.trim());
+
+  if (!hasName) {
+    return <CompleteNameScreen />;
+  }
+
+  return <AppTabs />;
+}
+
 export default function App() {
   const [fontsLoaded] = useFonts({
     Inter_400Regular,
@@ -122,13 +156,37 @@ export default function App() {
     );
   }
 
+  if (!isBackendConfigured) {
+    return <SetupScreen missingKeys={missingEnvKeys} />;
+  }
+
   return (
-    <SafeAreaProvider>
-      <NavigationContainer theme={navigationTheme}>
-        <StatusBar style="dark" />
-        <AppTabs />
-      </NavigationContainer>
-    </SafeAreaProvider>
+    <ClerkProvider
+      publishableKey={backendEnv.clerkPublishableKey}
+      tokenCache={tokenCache}
+    >
+      <SafeAreaProvider>
+        <NavigationContainer theme={navigationTheme}>
+          <StatusBar style="dark" />
+
+          <ClerkLoading>
+            <View style={styles.loaderWrap}>
+              <ActivityIndicator color={colors.primary} size="large" />
+              <Text style={styles.loaderText}>Preparing secure session...</Text>
+            </View>
+          </ClerkLoading>
+
+          <ClerkLoaded>
+            <SignedIn>
+              <SignedInGate />
+            </SignedIn>
+            <SignedOut>
+              <AuthScreen />
+            </SignedOut>
+          </ClerkLoaded>
+        </NavigationContainer>
+      </SafeAreaProvider>
+    </ClerkProvider>
   );
 }
 

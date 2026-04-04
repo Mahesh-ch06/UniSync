@@ -16,6 +16,7 @@ export const colors = {
   onSurfaceVariant: '#454652',
   onPrimary: '#FFFFFF',
   success: '#10B981',
+  error: '#BA1A1A',
 };
 
 export const spacing = {
