@@ -30,7 +30,14 @@
     },
     "plugins": [
       "expo-font",
-      "expo-web-browser"
+      "expo-web-browser",
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "Allow CampusFind to access photos so you can upload lost or found item images.",
+          "cameraPermission": "Allow CampusFind to use your camera to scan and report campus items."
+        }
+      ]
     ]
   }
 }

@@ -3,8 +3,20 @@
 ## Local Setup
 
 1. Create your app env file from [.env.example](.env.example).
-2. Start Expo: `npm run start:lan`
-3. Start backend locally (optional): `npm run backend:dev`
+2. Create backend env from [backend/.env.example](backend/.env.example) and set:
+	- `SUPABASE_URL`
+	- `SUPABASE_SERVICE_ROLE_KEY`
+	- `CLERK_SECRET_KEY`
+3. Run Supabase SQL migrations in order from [supabase/sql/README.md](supabase/sql/README.md).
+4. Start Expo: `npm run start:lan`
+5. Start backend locally: `npm run backend:dev`
+
+## Home Features Implemented
+
+- Campus points and level progression (`/api/points/me`)
+- Lost board feed (`/api/lost-items`)
+- Camera/gallery scan with item-type detection (`/api/vision/classify-item`)
+- Auto match claim submission with proof image (`/api/match-requests/auto`)
 
 ## Render Backend Setup
 

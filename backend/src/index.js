@@ -1,19 +1,23 @@
 const express = require('express');
 const cors = require('cors');
 const dotenv = require('dotenv');
+const path = require('path');
 const { createClient } = require('@supabase/supabase-js');
 const { verifyToken } = require('@clerk/backend');
 
+dotenv.config({ path: path.resolve(__dirname, '../.env') });
 dotenv.config();
 
 const app = express();
 const port = Number(process.env.PORT || 10000);
+const imageBucket = process.env.SUPABASE_IMAGE_BUCKET || 'campus-items';
 
 const clientOriginRaw = process.env.CLIENT_ORIGIN || '*';
 const allowedOrigins = clientOriginRaw
   .split(',')
   .map((value) => value.trim())
   .filter(Boolean);
+
 const supabaseUrl = process.env.SUPABASE_URL;
 const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const clerkSecretKey = process.env.CLERK_SECRET_KEY;
@@ -34,7 +38,6 @@ const supabase = createClient(supabaseUrl, serviceRoleKey, {
 app.use(
   cors({
     origin: (origin, callback) => {
-      // Requests from native mobile apps or server-side calls may not send Origin.
       if (!origin) {
         callback(null, true);
         return;
@@ -50,7 +53,265 @@ app.use(
     credentials: true,
   }),
 );
-app.use(express.json());
+app.use(express.json({ limit: process.env.JSON_BODY_LIMIT || '12mb' }));
+
+function readText(value) {
+  if (typeof value !== 'string') {
+    return '';
+  }
+
+  return value.trim();
+}
+
+function readPositiveNumber(value) {
+  if (typeof value === 'number' && Number.isFinite(value) && value > 0) {
+    return value;
+  }
+
+  if (typeof value === 'string') {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed) && parsed > 0) {
+      return parsed;
+    }
+  }
+
+  return 0;
+}
+
+function clampNumber(value, min, max) {
+  return Math.max(min, Math.min(max, value));
+}
+
+function tokenize(value) {
+  return Array.from(
+    new Set(
+      readText(value)
+        .toLowerCase()
+        .split(/[^a-z0-9]+/)
+        .filter((token) => token.length >= 3),
+    ),
+  );
+}
+
+function overlapCount(leftTokens, rightTokens) {
+  const rightSet = new Set(rightTokens);
+  return leftTokens.reduce((count, token) => count + (rightSet.has(token) ? 1 : 0), 0);
+}
+
+function extensionForMimeType(mimeType) {
+  if (mimeType === 'image/png') {
+    return 'png';
+  }
+
+  if (mimeType === 'image/webp') {
+    return 'webp';
+  }
+
+  return 'jpg';
+}
+
+function normalizeMimeType(value) {
+  const lower = readText(value).toLowerCase();
+
+  if (['image/jpeg', 'image/jpg', 'image/png', 'image/webp'].includes(lower)) {
+    return lower === 'image/jpg' ? 'image/jpeg' : lower;
+  }
+
+  return 'image/jpeg';
+}
+
+function stripBase64Prefix(value) {
+  return readText(value).replace(/^data:[^;]+;base64,/, '');
+}
+
+function classifyItemFromSignals({ hintText, fileName, width, height, preferredLabel, preferredCategory }) {
+  const joined = `${readText(hintText)} ${readText(fileName)}`.toLowerCase();
+
+  if (preferredLabel || preferredCategory) {
+    return {
+      label: readText(preferredLabel) || 'Item',
+      category: readText(preferredCategory) || 'General',
+      confidence: 0.98,
+      tags: tokenize(`${preferredLabel} ${preferredCategory}`).slice(0, 4),
+      source: 'manual',
+    };
+  }
+
+  const textRules = [
+    { pattern: /(laptop|macbook|notebook)/, label: 'Laptop', category: 'Electronics', tags: ['electronics', 'laptop'] },
+    { pattern: /(phone|iphone|android|mobile)/, label: 'Phone', category: 'Electronics', tags: ['electronics', 'phone'] },
+    { pattern: /(wallet|purse|cardholder)/, label: 'Wallet', category: 'Wallet', tags: ['wallet', 'cards'] },
+    { pattern: /(id card|student id|identity|id badge|badge)/, label: 'ID Card', category: 'Identity', tags: ['identity', 'card'] },
+    { pattern: /(keys|keychain|key ring|car key)/, label: 'Keys', category: 'Keys', tags: ['keys', 'metal'] },
+    { pattern: /(backpack|bag|sling|tote)/, label: 'Bag', category: 'Bags', tags: ['bag', 'carry'] },
+    { pattern: /(watch|smartwatch)/, label: 'Watch', category: 'Accessories', tags: ['watch', 'wearable'] },
+    { pattern: /(earbuds|headphone|airpods)/, label: 'Earbuds', category: 'Electronics', tags: ['audio', 'electronics'] },
+  ];
+
+  const matchedRule = textRules.find((rule) => rule.pattern.test(joined));
+  if (matchedRule) {
+    return {
+      label: matchedRule.label,
+      category: matchedRule.category,
+      confidence: 0.9,
+      tags: matchedRule.tags,
+      source: 'text',
+    };
+  }
+
+  const safeWidth = readPositiveNumber(width);
+  const safeHeight = readPositiveNumber(height);
+
+  if (safeWidth > 0 && safeHeight > 0) {
+    const ratio = safeWidth / safeHeight;
+    const area = safeWidth * safeHeight;
+
+    if (ratio > 1.25 && ratio < 1.9 && area > 200000) {
+      return {
+        label: 'Laptop',
+        category: 'Electronics',
+        confidence: 0.62,
+        tags: ['electronics', 'wide'],
+        source: 'shape',
+      };
+    }
+
+    if (ratio > 0.42 && ratio < 0.7) {
+      return {
+        label: 'Phone',
+        category: 'Electronics',
+        confidence: 0.58,
+        tags: ['electronics', 'portrait'],
+        source: 'shape',
+      };
+    }
+
+    if (ratio > 0.85 && ratio < 1.15 && area < 280000) {
+      return {
+        label: 'Wallet',
+        category: 'Wallet',
+        confidence: 0.54,
+        tags: ['wallet', 'compact'],
+        source: 'shape',
+      };
+    }
+  }
+
+  return {
+    label: 'Personal Item',
+    category: 'General',
+    confidence: 0.42,
+    tags: ['campus', 'item'],
+    source: 'fallback',
+  };
+}
+
+async function uploadBase64Image({ imageBase64, mimeType, folder, userId }) {
+  const base64Payload = stripBase64Prefix(imageBase64);
+
+  if (!base64Payload) {
+    throw new Error('Image base64 payload is missing.');
+  }
+
+  const normalizedMimeType = normalizeMimeType(mimeType);
+  const extension = extensionForMimeType(normalizedMimeType);
+  const fileName = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}.${extension}`;
+  const objectPath = `${folder}/${userId}/${fileName}`;
+  const imageBuffer = Buffer.from(base64Payload, 'base64');
+
+  const { error } = await supabase.storage.from(imageBucket).upload(objectPath, imageBuffer, {
+    contentType: normalizedMimeType,
+    cacheControl: '3600',
+    upsert: false,
+  });
+
+  if (error) {
+    throw error;
+  }
+
+  const { data } = supabase.storage.from(imageBucket).getPublicUrl(objectPath);
+
+  return {
+    imageUrl: data.publicUrl,
+    objectPath,
+  };
+}
+
+function formatReasonLabel(reason) {
+  return readText(reason) || 'activity';
+}
+
+function computeMatchScore({ foundItem, detection, hintText, locationHint }) {
+  const foundCategory = readText(foundItem.category).toLowerCase();
+  const foundTitle = readText(foundItem.title).toLowerCase();
+  const foundLocation = readText(foundItem.location).toLowerCase();
+
+  const detectedCategory = readText(detection.category).toLowerCase();
+  const detectedLabel = readText(detection.label).toLowerCase();
+  const normalizedHint = readText(hintText).toLowerCase();
+  const normalizedLocationHint = readText(locationHint).toLowerCase();
+
+  let score = 0;
+
+  if (detectedCategory && foundCategory === detectedCategory) {
+    score += 34;
+  } else if (detectedCategory && (foundCategory.includes(detectedCategory) || detectedCategory.includes(foundCategory))) {
+    score += 22;
+  }
+
+  if (detectedLabel && (foundTitle.includes(detectedLabel) || foundCategory.includes(detectedLabel))) {
+    score += 20;
+  }
+
+  const hintTokens = tokenize(normalizedHint);
+  const titleTokens = tokenize(foundTitle);
+  const titleOverlap = overlapCount(hintTokens, titleTokens);
+  score += Math.min(26, titleOverlap * 8);
+
+  const locationHintTokens = tokenize(normalizedLocationHint);
+  const locationTokens = tokenize(foundLocation);
+  const locationOverlap = overlapCount(locationHintTokens, locationTokens);
+  score += Math.min(16, locationOverlap * 8);
+
+  const createdAt = new Date(foundItem.created_at).getTime();
+  if (Number.isFinite(createdAt)) {
+    const ageHours = Math.max(Date.now() - createdAt, 0) / (1000 * 60 * 60);
+
+    if (ageHours <= 24) {
+      score += 12;
+    } else if (ageHours <= 72) {
+      score += 9;
+    } else if (ageHours <= 168) {
+      score += 6;
+    } else {
+      score += 3;
+    }
+  }
+
+  if (foundItem.image_url) {
+    score += 2;
+  }
+
+  return clampNumber(Math.round(score), 0, 100);
+}
+
+async function awardPointsSafely({ userId, points, reason, referenceType, referenceId }) {
+  if (!userId || !points) {
+    return;
+  }
+
+  const { error } = await supabase.rpc('award_points', {
+    p_user_id: userId,
+    p_points: points,
+    p_reason: formatReasonLabel(reason),
+    p_reference_type: referenceType || null,
+    p_reference_id: referenceId || null,
+  });
+
+  if (error) {
+    console.error('Failed to award points', error);
+  }
+}
 
 async function requireClerkAuth(req, res, next) {
   if (!clerkSecretKey) {
@@ -94,7 +355,7 @@ app.get('/api/found-items', async (_req, res) => {
       .from('found_items')
       .select('*')
       .order('created_at', { ascending: false })
-      .limit(50);
+      .limit(60);
 
     if (error) {
       throw error;
@@ -112,10 +373,12 @@ app.get('/api/found-items', async (_req, res) => {
 app.post('/api/found-items', requireClerkAuth, async (req, res) => {
   const body = req.body || {};
 
-  const title = typeof body.title === 'string' ? body.title.trim() : '';
-  const category = typeof body.category === 'string' ? body.category.trim() : 'General';
-  const location = typeof body.location === 'string' ? body.location.trim() : '';
-  const imageUrl = typeof body.image_url === 'string' ? body.image_url.trim() : null;
+  const title = readText(body.title);
+  const category = readText(body.category) || 'General';
+  const location = readText(body.location);
+  const imageUrlInput = readText(body.image_url);
+  const imageBase64 = readText(body.image_base64);
+  const mimeType = normalizeMimeType(body.mime_type);
 
   if (!title || !location) {
     res.status(400).json({ error: 'title and location are required.' });
@@ -123,6 +386,18 @@ app.post('/api/found-items', requireClerkAuth, async (req, res) => {
   }
 
   try {
+    let imageUrl = imageUrlInput || null;
+
+    if (!imageUrl && imageBase64) {
+      const uploaded = await uploadBase64Image({
+        imageBase64,
+        mimeType,
+        folder: 'found-items',
+        userId: req.auth.userId,
+      });
+      imageUrl = uploaded.imageUrl;
+    }
+
     const { data, error } = await supabase
       .from('found_items')
       .insert({
@@ -139,10 +414,360 @@ app.post('/api/found-items', requireClerkAuth, async (req, res) => {
       throw error;
     }
 
-    res.status(201).json({ item: data });
+    await awardPointsSafely({
+      userId: req.auth.userId,
+      points: 10,
+      reason: 'found_item_reported',
+      referenceType: 'found_item',
+      referenceId: data.id,
+    });
+
+    res.status(201).json({ item: data, pointsAwarded: 10 });
   } catch (error) {
     res.status(500).json({
       error: 'Failed to create found item.',
+      details: error && typeof error === 'object' && 'message' in error ? error.message : null,
+    });
+  }
+});
+
+app.get('/api/lost-items', async (_req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('lost_items')
+      .select('*')
+      .eq('status', 'open')
+      .order('created_at', { ascending: false })
+      .limit(40);
+
+    if (error) {
+      throw error;
+    }
+
+    res.json({ items: data ?? [] });
+  } catch (error) {
+    res.status(500).json({
+      error: 'Failed to fetch lost items.',
+      details: error && typeof error === 'object' && 'message' in error ? error.message : null,
+    });
+  }
+});
+
+app.post('/api/lost-items', requireClerkAuth, async (req, res) => {
+  const body = req.body || {};
+
+  const title = readText(body.title);
+  const description = readText(body.description);
+  const category = readText(body.category) || 'General';
+  const expectedLocation = readText(body.expected_location);
+  const imageBase64 = readText(body.image_base64);
+  const imageUrlInput = readText(body.image_url);
+  const mimeType = normalizeMimeType(body.mime_type);
+
+  if (!title) {
+    res.status(400).json({ error: 'title is required for lost item report.' });
+    return;
+  }
+
+  try {
+    let imageUrl = imageUrlInput || null;
+
+    if (!imageUrl && imageBase64) {
+      const uploaded = await uploadBase64Image({
+        imageBase64,
+        mimeType,
+        folder: 'lost-items',
+        userId: req.auth.userId,
+      });
+      imageUrl = uploaded.imageUrl;
+    }
+
+    const detection = classifyItemFromSignals({
+      hintText: `${title} ${description}`,
+      fileName: body.file_name,
+      width: body.width,
+      height: body.height,
+      preferredLabel: body.ai_detected_label,
+      preferredCategory: category,
+    });
+
+    const { data, error } = await supabase
+      .from('lost_items')
+      .insert({
+        title,
+        description: description || null,
+        category: category || detection.category,
+        expected_location: expectedLocation || null,
+        image_url: imageUrl,
+        ai_detected_label: detection.label,
+        reported_by: req.auth.userId,
+        status: 'open',
+      })
+      .select('*')
+      .single();
+
+    if (error) {
+      throw error;
+    }
+
+    await awardPointsSafely({
+      userId: req.auth.userId,
+      points: 8,
+      reason: 'lost_item_reported',
+      referenceType: 'lost_item',
+      referenceId: data.id,
+    });
+
+    res.status(201).json({ item: data, pointsAwarded: 8, detection });
+  } catch (error) {
+    res.status(500).json({
+      error: 'Failed to create lost item.',
+      details: error && typeof error === 'object' && 'message' in error ? error.message : null,
+    });
+  }
+});
+
+app.get('/api/points/me', requireClerkAuth, async (req, res) => {
+  try {
+    const { data: profile, error: profileError } = await supabase
+      .from('user_points')
+      .select('*')
+      .eq('user_id', req.auth.userId)
+      .maybeSingle();
+
+    if (profileError) {
+      throw profileError;
+    }
+
+    const { data: ledger, error: ledgerError } = await supabase
+      .from('points_ledger')
+      .select('id, points, reason, reference_type, reference_id, created_at')
+      .eq('user_id', req.auth.userId)
+      .order('created_at', { ascending: false })
+      .limit(12);
+
+    if (ledgerError) {
+      throw ledgerError;
+    }
+
+    res.json({
+      totalPoints: profile?.total_points ?? 0,
+      level: profile?.level ?? 'Seed',
+      recentActivity: ledger ?? [],
+    });
+  } catch (error) {
+    res.status(500).json({
+      error: 'Failed to fetch points summary.',
+      details: error && typeof error === 'object' && 'message' in error ? error.message : null,
+    });
+  }
+});
+
+app.post('/api/vision/classify-item', requireClerkAuth, async (req, res) => {
+  const body = req.body || {};
+  const imageBase64 = readText(body.image_base64);
+
+  if (!imageBase64) {
+    res.status(400).json({ error: 'image_base64 is required for scan.' });
+    return;
+  }
+
+  try {
+    const detection = classifyItemFromSignals({
+      hintText: `${readText(body.hint_text)} ${readText(body.location_hint)}`,
+      fileName: body.file_name,
+      width: body.width,
+      height: body.height,
+      preferredLabel: body.detected_label,
+      preferredCategory: body.detected_category,
+    });
+
+    const uploaded = await uploadBase64Image({
+      imageBase64,
+      mimeType: normalizeMimeType(body.mime_type),
+      folder: 'scans',
+      userId: req.auth.userId,
+    });
+
+    res.status(201).json({
+      detection,
+      imageUrl: uploaded.imageUrl,
+      objectPath: uploaded.objectPath,
+    });
+  } catch (error) {
+    res.status(500).json({
+      error: 'Failed to scan item image.',
+      details: error && typeof error === 'object' && 'message' in error ? error.message : null,
+    });
+  }
+});
+
+app.post('/api/match-requests/auto', requireClerkAuth, async (req, res) => {
+  const body = req.body || {};
+
+  const proofImageBase64 = readText(body.proof_image_base64);
+  const hintText = readText(body.hint_text);
+  const locationHint = readText(body.location_hint);
+  const lostTitle = readText(body.lost_title);
+  const lostDescription = readText(body.lost_description);
+
+  if (!proofImageBase64) {
+    res.status(400).json({ error: 'proof_image_base64 is required.' });
+    return;
+  }
+
+  try {
+    const detection = classifyItemFromSignals({
+      hintText,
+      fileName: body.file_name,
+      width: body.width,
+      height: body.height,
+      preferredLabel: body.detected_label,
+      preferredCategory: body.detected_category,
+    });
+
+    const uploadedProof = await uploadBase64Image({
+      imageBase64: proofImageBase64,
+      mimeType: normalizeMimeType(body.mime_type),
+      folder: 'proof',
+      userId: req.auth.userId,
+    });
+
+    let lostItemId = readText(body.lost_item_id);
+
+    if (!lostItemId) {
+      const { data: createdLost, error: lostInsertError } = await supabase
+        .from('lost_items')
+        .insert({
+          title: lostTitle || `Lost ${detection.label}`,
+          description: lostDescription || hintText || null,
+          category: detection.category,
+          expected_location: locationHint || null,
+          image_url: uploadedProof.imageUrl,
+          ai_detected_label: detection.label,
+          reported_by: req.auth.userId,
+          status: 'open',
+        })
+        .select('id')
+        .single();
+
+      if (lostInsertError) {
+        throw lostInsertError;
+      }
+
+      lostItemId = createdLost.id;
+
+      await awardPointsSafely({
+        userId: req.auth.userId,
+        points: 8,
+        reason: 'lost_item_reported',
+        referenceType: 'lost_item',
+        referenceId: lostItemId,
+      });
+    }
+
+    const { data: foundItems, error: foundError } = await supabase
+      .from('found_items')
+      .select('id, title, category, location, image_url, created_at')
+      .order('created_at', { ascending: false })
+      .limit(120);
+
+    if (foundError) {
+      throw foundError;
+    }
+
+    if (!foundItems || !foundItems.length) {
+      res.status(200).json({
+        matched: false,
+        reason: 'No found items available to match against yet.',
+        detection,
+        proofImageUrl: uploadedProof.imageUrl,
+        lostItemId,
+      });
+      return;
+    }
+
+    const scored = foundItems
+      .map((candidate) => ({
+        candidate,
+        score: computeMatchScore({
+          foundItem: candidate,
+          detection,
+          hintText,
+          locationHint,
+        }),
+      }))
+      .sort((left, right) => right.score - left.score);
+
+    const best = scored[0];
+
+    if (!best || best.score < 45) {
+      res.status(200).json({
+        matched: false,
+        reason: 'No strong match yet. We saved your loss report and proof image.',
+        detection,
+        proofImageUrl: uploadedProof.imageUrl,
+        lostItemId,
+        bestSuggestion: best
+          ? {
+              foundItemId: best.candidate.id,
+              title: best.candidate.title,
+              score: best.score,
+            }
+          : null,
+      });
+      return;
+    }
+
+    const { data: requestRow, error: requestError } = await supabase
+      .from('match_requests')
+      .insert({
+        found_item_id: best.candidate.id,
+        lost_item_id: lostItemId,
+        claimant_user_id: req.auth.userId,
+        proof_image_url: uploadedProof.imageUrl,
+        ai_detected_label: detection.label,
+        match_score: best.score,
+        status: 'submitted',
+      })
+      .select('*')
+      .single();
+
+    if (requestError) {
+      throw requestError;
+    }
+
+    await supabase
+      .from('lost_items')
+      .update({ status: 'matched' })
+      .eq('id', lostItemId)
+      .eq('reported_by', req.auth.userId);
+
+    await awardPointsSafely({
+      userId: req.auth.userId,
+      points: 15,
+      reason: 'match_request_submitted',
+      referenceType: 'match_request',
+      referenceId: requestRow.id,
+    });
+
+    res.status(201).json({
+      matched: true,
+      request: requestRow,
+      foundItem: {
+        id: best.candidate.id,
+        title: best.candidate.title,
+        category: best.candidate.category,
+        location: best.candidate.location,
+        image_url: best.candidate.image_url,
+      },
+      detection,
+      proofImageUrl: uploadedProof.imageUrl,
+      pointsAwarded: 15,
+    });
+  } catch (error) {
+    res.status(500).json({
+      error: 'Failed to auto-submit match request.',
       details: error && typeof error === 'object' && 'message' in error ? error.message : null,
     });
   }
