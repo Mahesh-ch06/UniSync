@@ -21,6 +21,9 @@ const allowedOrigins = clientOriginRaw
 const supabaseUrl = process.env.SUPABASE_URL;
 const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const clerkSecretKey = process.env.CLERK_SECRET_KEY;
+const geminiApiKey = readText(process.env.GEMINI_API_KEY);
+const geminiModel = readText(process.env.GEMINI_MODEL) || 'gemini-1.5-flash';
+const PICKUP_EDIT_WINDOW_MS = 5 * 60 * 1000;
 
 if (!supabaseUrl || !serviceRoleKey) {
   throw new Error(
@@ -218,6 +221,129 @@ function classifyItemFromSignals({ hintText, fileName, width, height, preferredL
   };
 }
 
+function parseJsonObjectFromText(text) {
+  const raw = readText(text);
+  if (!raw) {
+    return null;
+  }
+
+  const start = raw.indexOf('{');
+  const end = raw.lastIndexOf('}');
+
+  if (start < 0 || end < start) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(raw.slice(start, end + 1));
+  } catch {
+    return null;
+  }
+}
+
+async function classifyItemWithGemini({
+  imageBase64,
+  mimeType,
+  hintText,
+  locationHint,
+  fileName,
+  preferredLabel,
+  preferredCategory,
+}) {
+  if (!geminiApiKey) {
+    return null;
+  }
+
+  const imageData = stripBase64Prefix(imageBase64);
+  if (!imageData) {
+    return null;
+  }
+
+  const prompt = [
+    'You classify a campus lost-and-found product image.',
+    'Return strict JSON only with keys: label, category, confidence, tags.',
+    'label and category must be short strings.',
+    'confidence must be a number between 0 and 1.',
+    'tags must be an array of up to 6 lowercase tags.',
+    `context: hint=${readText(hintText)} location=${readText(locationHint)} file=${readText(fileName)} preferred_label=${readText(preferredLabel)} preferred_category=${readText(preferredCategory)}`,
+  ].join(' ');
+
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(geminiModel)}:generateContent?key=${encodeURIComponent(geminiApiKey)}`;
+
+  try {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        contents: [
+          {
+            role: 'user',
+            parts: [
+              { text: prompt },
+              {
+                inlineData: {
+                  mimeType: normalizeMimeType(mimeType),
+                  data: imageData,
+                },
+              },
+            ],
+          },
+        ],
+        generationConfig: {
+          temperature: 0.1,
+          maxOutputTokens: 220,
+          responseMimeType: 'application/json',
+        },
+      }),
+    });
+
+    if (!response.ok) {
+      const details = await response.text().catch(() => '');
+      throw new Error(`Gemini request failed (${response.status}) ${details}`.trim());
+    }
+
+    const payload = await response.json();
+    const parts = payload?.candidates?.[0]?.content?.parts;
+
+    const rawText = Array.isArray(parts)
+      ? parts
+          .map((part) => (part && typeof part.text === 'string' ? part.text : ''))
+          .join('\n')
+          .trim()
+      : '';
+
+    const parsed = parseJsonObjectFromText(rawText);
+    if (!parsed || typeof parsed !== 'object') {
+      return null;
+    }
+
+    const label = readText(parsed.label) || 'Personal Item';
+    const category = readText(parsed.category) || 'General';
+    const confidence = clampNumber(Number(parsed.confidence) || 0.56, 0.01, 0.99);
+
+    const tags = Array.isArray(parsed.tags)
+      ? parsed
+          .tags
+          .map((value) => readText(value).toLowerCase())
+          .filter(Boolean)
+          .slice(0, 6)
+      : [];
+
+    return {
+      label,
+      category,
+      confidence,
+      tags: tags.length ? tags : tokenize(`${label} ${category}`).slice(0, 6),
+      source: 'gemini',
+    };
+  } catch (error) {
+    console.error('Gemini classification failed, falling back to local rules.', error);
+    return null;
+  }
+}
+
 async function uploadBase64Image({ imageBase64, mimeType, folder, userId }) {
   const base64Payload = stripBase64Prefix(imageBase64);
 
@@ -323,6 +449,110 @@ async function awardPointsSafely({ userId, points, reason, referenceType, refere
   if (error) {
     console.error('Failed to award points', error);
   }
+}
+
+function resolvePickupEditWindow(pickupConfirmedAt) {
+  const iso = readText(pickupConfirmedAt);
+  if (!iso) {
+    return {
+      editableUntil: null,
+      isEditable: false,
+      remainingSeconds: 0,
+    };
+  }
+
+  const pickupMs = new Date(iso).getTime();
+  if (!Number.isFinite(pickupMs)) {
+    return {
+      editableUntil: null,
+      isEditable: false,
+      remainingSeconds: 0,
+    };
+  }
+
+  const editableUntilMs = pickupMs + PICKUP_EDIT_WINDOW_MS;
+  const remainingMs = Math.max(editableUntilMs - Date.now(), 0);
+
+  return {
+    editableUntil: new Date(editableUntilMs).toISOString(),
+    isEditable: remainingMs > 0,
+    remainingSeconds: Math.ceil(remainingMs / 1000),
+  };
+}
+
+async function awardPointsOnce({ userId, points, reason, referenceType, referenceId }) {
+  if (!userId || !points) {
+    return false;
+  }
+
+  const normalizedReason = formatReasonLabel(reason);
+
+  if (referenceType && referenceId) {
+    const { data: existing, error: existingError } = await supabase
+      .from('points_ledger')
+      .select('id')
+      .eq('user_id', userId)
+      .eq('reason', normalizedReason)
+      .eq('reference_type', referenceType)
+      .eq('reference_id', referenceId)
+      .limit(1);
+
+    if (!existingError && existing && existing.length) {
+      return false;
+    }
+  }
+
+  await awardPointsSafely({
+    userId,
+    points,
+    reason: normalizedReason,
+    referenceType,
+    referenceId,
+  });
+
+  return true;
+}
+
+async function loadMatchRequestWithParticipants(requestId) {
+  const { data, error } = await supabase
+    .from('match_requests')
+    .select(
+      `
+      id,
+      found_item_id,
+      lost_item_id,
+      claimant_user_id,
+      status,
+      created_at,
+      reviewed_at,
+      reviewer_user_id,
+      pickup_confirmed_at,
+      pickup_confirmed_by,
+      found_item:found_items!inner(
+        id,
+        title,
+        category,
+        location,
+        image_url,
+        created_by
+      )
+    `,
+    )
+    .eq('id', requestId)
+    .maybeSingle();
+
+  if (error) {
+    throw error;
+  }
+
+  if (!data) {
+    return null;
+  }
+
+  return {
+    ...data,
+    found_item: relationObject(data.found_item),
+  };
 }
 
 async function resolveUserIdFromAuthHeader(authHeader) {
@@ -679,14 +909,24 @@ app.post('/api/vision/classify-item', requireClerkAuth, async (req, res) => {
   }
 
   try {
-    const detection = classifyItemFromSignals({
+    const detection =
+      (await classifyItemWithGemini({
+        imageBase64,
+        mimeType: body.mime_type,
+        hintText: body.hint_text,
+        locationHint: body.location_hint,
+        fileName: body.file_name,
+        preferredLabel: body.detected_label,
+        preferredCategory: body.detected_category,
+      })) ||
+      classifyItemFromSignals({
       hintText: `${readText(body.hint_text)} ${readText(body.location_hint)}`,
       fileName: body.file_name,
       width: body.width,
       height: body.height,
       preferredLabel: body.detected_label,
       preferredCategory: body.detected_category,
-    });
+      });
 
     const uploaded = await uploadBase64Image({
       imageBase64,
@@ -1136,11 +1376,22 @@ app.get('/api/match-requests/history/me', requireClerkAuth, async (req, res) => 
 
     const userId = req.auth.userId;
     const items = (data ?? [])
-      .map((row) => ({
-        ...row,
-        found_item: relationObject(row.found_item),
-        lost_item: relationObject(row.lost_item),
-      }))
+      .map((row) => {
+        const normalized = {
+          ...row,
+          found_item: relationObject(row.found_item),
+          lost_item: relationObject(row.lost_item),
+        };
+
+        const pickupEditWindow = resolvePickupEditWindow(normalized.pickup_confirmed_at);
+
+        return {
+          ...normalized,
+          pickup_editable_until: pickupEditWindow.editableUntil,
+          pickup_is_editable: pickupEditWindow.isEditable,
+          pickup_edit_seconds_remaining: pickupEditWindow.remainingSeconds,
+        };
+      })
       .filter((row) => {
         const ownerId = readText(row.found_item?.created_by);
         const claimantId = readText(row.claimant_user_id);
@@ -1421,7 +1672,7 @@ app.post('/api/match-requests/:requestId/confirm-pickup', requireClerkAuth, asyn
     const finderPickupPoints = 15;
     const claimantPickupPoints = ownerId !== claimantUserId ? 10 : 0;
 
-    await awardPointsSafely({
+    const finderPointsAwardedNow = await awardPointsOnce({
       userId: ownerId,
       points: finderPickupPoints,
       reason: 'owner_pickup_confirmed',
@@ -1430,7 +1681,7 @@ app.post('/api/match-requests/:requestId/confirm-pickup', requireClerkAuth, asyn
     });
 
     if (claimantPickupPoints > 0) {
-      await awardPointsSafely({
+      await awardPointsOnce({
         userId: claimantUserId,
         points: claimantPickupPoints,
         reason: 'item_received',
@@ -1439,15 +1690,212 @@ app.post('/api/match-requests/:requestId/confirm-pickup', requireClerkAuth, asyn
       });
     }
 
+    const pickupEditWindow = resolvePickupEditWindow(updatedRequest.pickup_confirmed_at);
+
     res.json({
       confirmed: true,
       request: updatedRequest,
-      finderPickupPoints,
+      finderPickupPoints: finderPointsAwardedNow ? finderPickupPoints : 0,
       claimantPickupPoints,
+      pickupEditableUntil: pickupEditWindow.editableUntil,
+      pickupEditSecondsRemaining: pickupEditWindow.remainingSeconds,
     });
   } catch (error) {
     res.status(500).json({
       error: 'Failed to confirm pickup.',
+      details: error && typeof error === 'object' && 'message' in error ? error.message : null,
+    });
+  }
+});
+
+app.post('/api/match-requests/:requestId/revert-pickup', requireClerkAuth, async (req, res) => {
+  const requestId = readText(req.params.requestId);
+
+  if (!requestId) {
+    res.status(400).json({ error: 'requestId is required.' });
+    return;
+  }
+
+  try {
+    const requestRow = await loadMatchRequestWithParticipants(requestId);
+
+    if (!requestRow) {
+      res.status(404).json({ error: 'Match request not found.' });
+      return;
+    }
+
+    const ownerId = readText(requestRow.found_item?.created_by);
+    if (ownerId !== req.auth.userId) {
+      res.status(403).json({ error: 'Only uploader can update pickup status.' });
+      return;
+    }
+
+    if (readText(requestRow.status) !== 'picked_up') {
+      res.status(409).json({ error: 'Only picked up claims can be changed back.' });
+      return;
+    }
+
+    const pickupEditWindow = resolvePickupEditWindow(requestRow.pickup_confirmed_at);
+    if (!pickupEditWindow.isEditable) {
+      res.status(409).json({
+        error: 'Pickup status can only be changed within 5 minutes.',
+        editableUntil: pickupEditWindow.editableUntil,
+      });
+      return;
+    }
+
+    const { data: updatedRequest, error: updateError } = await supabase
+      .from('match_requests')
+      .update({
+        status: 'approved',
+        pickup_confirmed_at: null,
+        pickup_confirmed_by: null,
+      })
+      .eq('id', requestId)
+      .eq('status', 'picked_up')
+      .select('*')
+      .maybeSingle();
+
+    if (updateError) {
+      throw updateError;
+    }
+
+    if (!updatedRequest) {
+      res.status(409).json({ error: 'Could not revert pickup status. Request changed.' });
+      return;
+    }
+
+    if (readText(requestRow.lost_item_id)) {
+      await supabase
+        .from('lost_items')
+        .update({ status: 'claimed' })
+        .eq('id', requestRow.lost_item_id);
+    }
+
+    res.json({
+      reverted: true,
+      request: updatedRequest,
+      message: 'Pickup was reverted. You can confirm pickup again when handover is complete.',
+    });
+  } catch (error) {
+    res.status(500).json({
+      error: 'Failed to revert pickup status.',
+      details: error && typeof error === 'object' && 'message' in error ? error.message : null,
+    });
+  }
+});
+
+app.get('/api/match-requests/:requestId/messages', requireClerkAuth, async (req, res) => {
+  const requestId = readText(req.params.requestId);
+
+  if (!requestId) {
+    res.status(400).json({ error: 'requestId is required.' });
+    return;
+  }
+
+  try {
+    const requestRow = await loadMatchRequestWithParticipants(requestId);
+
+    if (!requestRow) {
+      res.status(404).json({ error: 'Match request not found.' });
+      return;
+    }
+
+    const ownerId = readText(requestRow.found_item?.created_by);
+    const claimantId = readText(requestRow.claimant_user_id);
+
+    if (req.auth.userId !== ownerId && req.auth.userId !== claimantId) {
+      res.status(403).json({ error: 'You are not allowed to access this message thread.' });
+      return;
+    }
+
+    const { data: messages, error: messagesError } = await supabase
+      .from('match_request_messages')
+      .select('id, match_request_id, sender_user_id, message_text, created_at')
+      .eq('match_request_id', requestId)
+      .order('created_at', { ascending: true })
+      .limit(200);
+
+    if (messagesError) {
+      throw messagesError;
+    }
+
+    res.json({
+      items: messages ?? [],
+      messagingActive: readText(requestRow.status) !== 'picked_up',
+      requestStatus: readText(requestRow.status),
+      foundItem: requestRow.found_item,
+    });
+  } catch (error) {
+    res.status(500).json({
+      error: 'Failed to fetch messages.',
+      details: error && typeof error === 'object' && 'message' in error ? error.message : null,
+    });
+  }
+});
+
+app.post('/api/match-requests/:requestId/messages', requireClerkAuth, async (req, res) => {
+  const requestId = readText(req.params.requestId);
+  const messageText = readText(req.body?.message);
+
+  if (!requestId) {
+    res.status(400).json({ error: 'requestId is required.' });
+    return;
+  }
+
+  if (!messageText) {
+    res.status(400).json({ error: 'message is required.' });
+    return;
+  }
+
+  if (messageText.length > 1000) {
+    res.status(400).json({ error: 'message must be 1000 characters or less.' });
+    return;
+  }
+
+  try {
+    const requestRow = await loadMatchRequestWithParticipants(requestId);
+
+    if (!requestRow) {
+      res.status(404).json({ error: 'Match request not found.' });
+      return;
+    }
+
+    const ownerId = readText(requestRow.found_item?.created_by);
+    const claimantId = readText(requestRow.claimant_user_id);
+
+    if (req.auth.userId !== ownerId && req.auth.userId !== claimantId) {
+      res.status(403).json({ error: 'You are not allowed to send messages for this request.' });
+      return;
+    }
+
+    if (readText(requestRow.status) === 'picked_up') {
+      res.status(409).json({ error: 'Messaging is closed after item is marked picked up.' });
+      return;
+    }
+
+    const { data: messageRow, error: insertError } = await supabase
+      .from('match_request_messages')
+      .insert({
+        match_request_id: requestId,
+        sender_user_id: req.auth.userId,
+        message_text: messageText,
+      })
+      .select('id, match_request_id, sender_user_id, message_text, created_at')
+      .single();
+
+    if (insertError) {
+      throw insertError;
+    }
+
+    res.status(201).json({
+      message: messageRow,
+      messagingActive: true,
+      requestStatus: readText(requestRow.status),
+    });
+  } catch (error) {
+    res.status(500).json({
+      error: 'Failed to send message.',
       details: error && typeof error === 'object' && 'message' in error ? error.message : null,
     });
   }

@@ -17,3 +17,5 @@ Run files in numeric order:
 13. 013_verify_loss_match_points.sql (optional)
 14. 014_match_request_pickup_lifecycle.sql
 15. 015_verify_match_request_pickup_history.sql (optional)
+16. 016_match_request_messages.sql
+17. 017_verify_match_request_messages.sql (optional)

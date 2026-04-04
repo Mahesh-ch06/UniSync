@@ -18,7 +18,7 @@ import {
 import { backendEnv } from '../config/env';
 import { colors, fontFamily, radii, shadows } from '../theme/tokens';
 
-type StudioMode = 'lost' | 'claim';
+type StudioMode = 'lost' | 'claim' | 'found';
 
 type PickedImage = {
   uri: string;
@@ -63,6 +63,9 @@ type IncomingClaim = {
   reviewed_at: string | null;
   pickup_confirmed_at: string | null;
   pickup_confirmed_by: string | null;
+  pickup_editable_until: string | null;
+  pickup_is_editable: boolean;
+  pickup_edit_seconds_remaining: number;
   found_item: {
     id: string;
     title: string;
@@ -87,6 +90,16 @@ type ClaimableItemOption = {
   image_url: string | null;
 };
 
+type ClaimMessage = {
+  id: string;
+  sender_user_id: string;
+  message_text: string;
+  created_at: string | null;
+};
+
+type HistoryFilter = 'all' | 'active' | 'completed';
+type StudioLayout = 'full' | 'quick' | 'history';
+
 type PointsActivity = {
   id: number;
   points: number;
@@ -103,7 +116,13 @@ type PointsSummary = {
 type CampusActionStudioProps = {
   onActionsFinished?: () => Promise<void> | void;
   compact?: boolean;
+  layout?: StudioLayout;
   claimableItems?: ClaimableItemOption[];
+  claimIntentItemId?: string;
+  claimIntentNonce?: number;
+  focusClaimRequestId?: string;
+  focusClaimNonce?: number;
+  autoOpenFocusedClaimMessages?: boolean;
 };
 
 const LEVEL_STEPS = [
@@ -176,6 +195,51 @@ function formatReason(reason: string): string {
   return normalized[0].toUpperCase() + normalized.slice(1);
 }
 
+function formatStatusLabel(status: string): string {
+  const normalized = safeString(status).replace(/_/g, ' ');
+  if (!normalized) {
+    return 'unknown';
+  }
+
+  return normalized[0].toUpperCase() + normalized.slice(1);
+}
+
+function resolveStatusTone(status: string): { bg: string; fg: string } {
+  if (status === 'approved') {
+    return {
+      bg: '#E8F7ED',
+      fg: '#1C6E44',
+    };
+  }
+
+  if (status === 'rejected') {
+    return {
+      bg: '#FFE8E8',
+      fg: '#A13232',
+    };
+  }
+
+  if (status === 'picked_up') {
+    return {
+      bg: '#E8EEFF',
+      fg: '#2B4D9E',
+    };
+  }
+
+  return {
+    bg: colors.surfaceLow,
+    fg: colors.onSurfaceVariant,
+  };
+}
+
+function minutesLeft(seconds: number): number {
+  if (!Number.isFinite(seconds) || seconds <= 0) {
+    return 0;
+  }
+
+  return Math.ceil(seconds / 60);
+}
+
 function normalizeScanDetection(value: unknown): ScanDetection {
   if (!value || typeof value !== 'object') {
     return {
@@ -240,6 +304,9 @@ function normalizeIncomingClaim(value: unknown): IncomingClaim | null {
     reviewed_at: safeString(row.reviewed_at) || null,
     pickup_confirmed_at: safeString(row.pickup_confirmed_at) || null,
     pickup_confirmed_by: safeString(row.pickup_confirmed_by) || null,
+    pickup_editable_until: safeString(row.pickup_editable_until) || null,
+    pickup_is_editable: Boolean(row.pickup_is_editable),
+    pickup_edit_seconds_remaining: Math.max(0, safeNumber(row.pickup_edit_seconds_remaining)),
     found_item: {
       id: foundItemId,
       title: safeString(foundItemRaw.title) || 'Found item',
@@ -284,11 +351,18 @@ function nextLevelProgress(points: number): { nextLabel: string; remaining: numb
 export function CampusActionStudio({
   onActionsFinished,
   compact = false,
+  layout = 'full',
   claimableItems = [],
+  claimIntentItemId,
+  claimIntentNonce = 0,
+  focusClaimRequestId,
+  focusClaimNonce = 0,
+  autoOpenFocusedClaimMessages = false,
 }: CampusActionStudioProps) {
   const { getToken } = useAuth();
   const { user } = useUser();
   const getTokenRef = useRef(getToken);
+  const lastHandledClaimIntentNonceRef = useRef(0);
   const currentUserId = safeString(user?.id);
 
   const backendBaseUrl = useMemo(() => backendEnv.backendUrl.replace(/\/+$/, ''), []);
@@ -306,6 +380,28 @@ export function CampusActionStudio({
   const [isPanelLoading, setIsPanelLoading] = useState(true);
   const [isResolvingClaimId, setIsResolvingClaimId] = useState('');
   const [isConfirmingPickupId, setIsConfirmingPickupId] = useState('');
+  const [isRevertingPickupId, setIsRevertingPickupId] = useState('');
+  const [historyFilter, setHistoryFilter] = useState<HistoryFilter>('all');
+  const [focusedHistoryClaimId, setFocusedHistoryClaimId] = useState('');
+
+  const [pickupNotice, setPickupNotice] = useState<{
+    visible: boolean;
+    claimId: string;
+    secondsRemaining: number;
+  }>({
+    visible: false,
+    claimId: '',
+    secondsRemaining: 0,
+  });
+
+  const [isMessagesModalVisible, setIsMessagesModalVisible] = useState(false);
+  const [messagesClaim, setMessagesClaim] = useState<IncomingClaim | null>(null);
+  const [messages, setMessages] = useState<ClaimMessage[]>([]);
+  const [messagesInput, setMessagesInput] = useState('');
+  const [isMessagesLoading, setIsMessagesLoading] = useState(false);
+  const [isSendingMessage, setIsSendingMessage] = useState(false);
+  const [messagesError, setMessagesError] = useState('');
+  const [isMessagingActive, setIsMessagingActive] = useState(true);
 
   const [isModalVisible, setIsModalVisible] = useState(false);
   const [mode, setMode] = useState<StudioMode>('lost');
@@ -341,6 +437,10 @@ export function CampusActionStudio({
     [claimHistory.length, incomingClaims.length, lostBoard.length, points.recentActivity],
   );
 
+  const showComposerSections = layout !== 'history';
+  const showClaimOperations = layout !== 'quick';
+  const showLostBoard = layout !== 'history';
+
   const pickupQueue = useMemo(
     () =>
       claimHistory
@@ -352,6 +452,45 @@ export function CampusActionStudio({
         .slice(0, compact ? 1 : 4),
     [claimHistory, compact, currentUserId],
   );
+
+  const filteredHistory = useMemo(() => {
+    const filtered = claimHistory.filter((entry) => {
+      if (historyFilter === 'active') {
+        return entry.status === 'approved';
+      }
+
+      if (historyFilter === 'completed') {
+        return entry.status !== 'approved';
+      }
+
+      return true;
+    });
+
+    return filtered.slice(0, compact ? 3 : 8);
+  }, [claimHistory, compact, historyFilter]);
+
+  const historyOverview = useMemo(() => {
+    const active = claimHistory.filter((entry) => entry.status === 'approved').length;
+    const completed = claimHistory.filter((entry) => entry.status !== 'approved').length;
+
+    return {
+      all: claimHistory.length,
+      active,
+      completed,
+    };
+  }, [claimHistory]);
+
+  const historyEmptySubtitle = useMemo(() => {
+    if (historyFilter === 'active') {
+      return 'No active approved claims right now.';
+    }
+
+    if (historyFilter === 'completed') {
+      return 'No completed or closed claims yet.';
+    }
+
+    return 'No claim activity recorded yet.';
+  }, [historyFilter]);
 
   const selectedClaimItem = useMemo(
     () => claimableItems.find((item) => item.id === selectedClaimItemId) ?? null,
@@ -394,6 +533,29 @@ export function CampusActionStudio({
           'Content-Type': 'application/json',
         },
         body: JSON.stringify(body),
+      });
+
+      if (!response.ok) {
+        throw new Error(await readResponseError(response));
+      }
+
+      return (await response.json()) as Record<string, unknown>;
+    },
+    [backendBaseUrl, readResponseError],
+  );
+
+  const authedGetRequest = useCallback(
+    async (path: string) => {
+      const token = await getTokenRef.current();
+
+      if (!token) {
+        throw new Error('You need to be signed in to continue.');
+      }
+
+      const response = await fetch(`${backendBaseUrl}${path}`, {
+        headers: {
+          Authorization: `Bearer ${token}`,
+        },
       });
 
       if (!response.ok) {
@@ -597,6 +759,27 @@ export function CampusActionStudio({
     [claimableItems, resetComposer],
   );
 
+  useEffect(() => {
+    if (!claimIntentNonce || !claimIntentItemId) {
+      return;
+    }
+
+    if (claimIntentNonce <= lastHandledClaimIntentNonceRef.current) {
+      return;
+    }
+
+    lastHandledClaimIntentNonceRef.current = claimIntentNonce;
+
+    setMode('claim');
+    resetComposer();
+
+    const matched = claimableItems.find((item) => item.id === claimIntentItemId);
+    const fallback = claimableItems[0];
+
+    setSelectedClaimItemId(matched?.id || fallback?.id || claimIntentItemId);
+    setIsModalVisible(true);
+  }, [claimIntentItemId, claimIntentNonce, claimableItems, resetComposer]);
+
   const closeComposer = useCallback(() => {
     setIsModalVisible(false);
     setActionError('');
@@ -797,6 +980,76 @@ export function CampusActionStudio({
     title,
   ]);
 
+  const submitFoundItem = useCallback(async () => {
+    if (!pickedImage) {
+      setActionError('Please upload an image first.');
+      return;
+    }
+
+    setIsWorking(true);
+    setActionError('');
+    setActionNotice('');
+
+    try {
+      const ensuredScan = scanResult ?? (await runScan());
+
+      if (!ensuredScan) {
+        return;
+      }
+
+      const payload = await authedJsonRequest('/api/found-items', {
+        title: title.trim() || `Found ${ensuredScan.detection.label}`,
+        category: ensuredScan.detection.category,
+        location: locationHint.trim() || 'Campus location',
+        image_base64: pickedImage.base64,
+        image_url: ensuredScan.imageUrl,
+        mime_type: pickedImage.mimeType,
+        width: pickedImage.width,
+        height: pickedImage.height,
+        file_name: pickedImage.fileName,
+        description: description.trim(),
+      });
+
+      const pointsAwarded = Math.max(0, safeNumber(payload.pointsAwarded));
+
+      setActionNotice(
+        pointsAwarded
+          ? `Found item posted successfully. +${pointsAwarded} points added.`
+          : 'Found item posted successfully.',
+      );
+
+      await loadPanelData();
+      await Promise.resolve(onActionsFinished?.());
+
+      setTimeout(() => {
+        closeComposer();
+      }, 700);
+    } catch (error) {
+      const message =
+        typeof error === 'object' &&
+        error !== null &&
+        'message' in error &&
+        typeof (error as { message?: unknown }).message === 'string'
+          ? (error as { message: string }).message
+          : 'Failed to submit found item.';
+
+      setActionError(message);
+    } finally {
+      setIsWorking(false);
+    }
+  }, [
+    authedJsonRequest,
+    closeComposer,
+    description,
+    loadPanelData,
+    locationHint,
+    onActionsFinished,
+    pickedImage,
+    runScan,
+    scanResult,
+    title,
+  ]);
+
   const submitAutoClaim = useCallback(async () => {
     if (!selectedClaimItemId) {
       setActionError(
@@ -949,6 +1202,7 @@ export function CampusActionStudio({
 
         const finderPoints = Math.max(0, safeNumber(payload.finderPickupPoints));
         const claimantPoints = Math.max(0, safeNumber(payload.claimantPickupPoints));
+        const editWindowSeconds = Math.max(0, safeNumber(payload.pickupEditSecondsRemaining));
 
         await loadPanelData();
         await Promise.resolve(onActionsFinished?.());
@@ -958,6 +1212,12 @@ export function CampusActionStudio({
             claimantPoints ? `, owner +${claimantPoints} points` : ''
           }. History updated for both users.`,
         );
+
+        setPickupNotice({
+          visible: true,
+          claimId,
+          secondsRemaining: editWindowSeconds,
+        });
       } catch (error) {
         const message =
           typeof error === 'object' &&
@@ -975,7 +1235,177 @@ export function CampusActionStudio({
     [authedJsonRequest, loadPanelData, onActionsFinished],
   );
 
-  const isClaimSubmitBlocked = mode === 'claim' && !selectedClaimItemId;
+  const revertPickup = useCallback(
+    async (claimId: string) => {
+      if (!claimId) {
+        return;
+      }
+
+      setIsRevertingPickupId(claimId);
+      setPanelError('');
+      setPanelNotice('');
+
+      try {
+        await authedJsonRequest(`/api/match-requests/${claimId}/revert-pickup`, {});
+
+        setPickupNotice({
+          visible: false,
+          claimId: '',
+          secondsRemaining: 0,
+        });
+
+        await loadPanelData();
+        await Promise.resolve(onActionsFinished?.());
+        setPanelNotice('Pickup reverted. Status moved back to approved.');
+      } catch (error) {
+        const message =
+          typeof error === 'object' &&
+          error !== null &&
+          'message' in error &&
+          typeof (error as { message?: unknown }).message === 'string'
+            ? (error as { message: string }).message
+            : 'Failed to revert pickup status.';
+
+        setPanelError(message);
+      } finally {
+        setIsRevertingPickupId('');
+      }
+    },
+    [authedJsonRequest, loadPanelData, onActionsFinished],
+  );
+
+  const openMessages = useCallback(
+    async (claim: IncomingClaim) => {
+      if (!claim.id) {
+        return;
+      }
+
+      setIsMessagesModalVisible(true);
+      setMessagesClaim(claim);
+      setMessages([]);
+      setMessagesInput('');
+      setMessagesError('');
+      setIsMessagesLoading(true);
+
+      try {
+        const payload = await authedGetRequest(`/api/match-requests/${claim.id}/messages`);
+        const rows = Array.isArray(payload.items)
+          ? payload.items
+              .map((entry) => {
+                const item = entry as Record<string, unknown>;
+
+                return {
+                  id: safeString(item.id) || `${Date.now()}-${Math.random()}`,
+                  sender_user_id: safeString(item.sender_user_id),
+                  message_text: safeString(item.message_text),
+                  created_at: safeString(item.created_at) || null,
+                };
+              })
+              .filter((entry) => Boolean(entry.message_text))
+          : [];
+
+        setMessages(rows);
+        setIsMessagingActive(Boolean(payload.messagingActive));
+      } catch (error) {
+        const message =
+          typeof error === 'object' &&
+          error !== null &&
+          'message' in error &&
+          typeof (error as { message?: unknown }).message === 'string'
+            ? (error as { message: string }).message
+            : 'Failed to load messages.';
+
+        setMessagesError(message);
+      } finally {
+        setIsMessagesLoading(false);
+      }
+    },
+    [authedGetRequest],
+  );
+
+  const sendMessage = useCallback(async () => {
+    if (!messagesClaim?.id) {
+      return;
+    }
+
+    const message = messagesInput.trim();
+    if (!message) {
+      return;
+    }
+
+    setIsSendingMessage(true);
+    setMessagesError('');
+
+    try {
+      const payload = await authedJsonRequest(`/api/match-requests/${messagesClaim.id}/messages`, {
+        message,
+      });
+
+      const row =
+        payload.message && typeof payload.message === 'object'
+          ? (payload.message as Record<string, unknown>)
+          : null;
+
+      if (row) {
+        setMessages((previous) => [
+          ...previous,
+          {
+            id: safeString(row.id) || `${Date.now()}-${Math.random()}`,
+            sender_user_id: safeString(row.sender_user_id),
+            message_text: safeString(row.message_text),
+            created_at: safeString(row.created_at) || new Date().toISOString(),
+          },
+        ]);
+      }
+
+      setMessagesInput('');
+      setIsMessagingActive(Boolean(payload.messagingActive));
+    } catch (error) {
+      const messageText =
+        typeof error === 'object' &&
+        error !== null &&
+        'message' in error &&
+        typeof (error as { message?: unknown }).message === 'string'
+          ? (error as { message: string }).message
+          : 'Failed to send message.';
+
+      setMessagesError(messageText);
+    } finally {
+      setIsSendingMessage(false);
+    }
+  }, [authedJsonRequest, messagesClaim, messagesInput]);
+
+  useEffect(() => {
+    if (!focusClaimRequestId || !focusClaimNonce) {
+      return;
+    }
+
+    setHistoryFilter('all');
+    setFocusedHistoryClaimId(focusClaimRequestId);
+
+    const targetClaim =
+      claimHistory.find((entry) => entry.id === focusClaimRequestId) ||
+      incomingClaims.find((entry) => entry.id === focusClaimRequestId);
+
+    if (!targetClaim) {
+      return;
+    }
+
+    setPanelNotice(`Opened claim for ${targetClaim.found_item.title}. Continue below.`);
+
+    if (autoOpenFocusedClaimMessages && targetClaim.status !== 'picked_up') {
+      void openMessages(targetClaim);
+    }
+  }, [
+    autoOpenFocusedClaimMessages,
+    claimHistory,
+    focusClaimNonce,
+    focusClaimRequestId,
+    incomingClaims,
+    openMessages,
+  ]);
+
+  const isClaimSubmitBlocked = mode === 'claim' && !selectedClaimItem;
 
   return (
     <View style={styles.root}>
@@ -1019,226 +1449,607 @@ export function CampusActionStudio({
         ) : null}
       </View>
 
-      <View style={compact ? styles.quickWidgetsRowCompact : styles.quickWidgetsRow}>
-        <View style={styles.quickWidgetCard}>
-          <Text style={styles.quickWidgetLabel}>Open Lost</Text>
-          <Text style={styles.quickWidgetValue}>{quickWidgetMetrics.openLostCount}</Text>
-        </View>
-
-        <View style={styles.quickWidgetCard}>
-          <Text style={styles.quickWidgetLabel}>Pending Claims</Text>
-          <Text style={styles.quickWidgetValue}>{quickWidgetMetrics.pendingClaimsCount}</Text>
-        </View>
-
-        {!compact ? (
-          <View style={styles.quickWidgetCard}>
-            <Text style={styles.quickWidgetLabel}>Recent Rewards</Text>
-            <Text style={styles.quickWidgetValue}>{quickWidgetMetrics.recentRewards}</Text>
-          </View>
-        ) : null}
-      </View>
-
-      <View style={styles.studioCard}>
-        <Text style={styles.studioTitle}>Campus AI Studio</Text>
-        <Text style={styles.studioSubtitle}>
-          Upload from camera/gallery, detect item type, and submit lost report or claim request instantly.
-        </Text>
-
-        <View style={styles.studioActionRow}>
-          <Pressable onPress={() => openComposer('lost')} style={styles.primaryAction}>
-            <MaterialIcons color={colors.onPrimary} name="add-photo-alternate" size={16} />
-            <Text style={styles.primaryActionText}>Report Lost Item</Text>
-          </Pressable>
-
-          <Pressable onPress={() => openComposer('claim')} style={styles.secondaryAction}>
-            <MaterialIcons color={colors.primary} name="fact-check" size={16} />
-            <Text style={styles.secondaryActionText}>Proof Scan Claim</Text>
-          </Pressable>
-        </View>
-
-        {panelError ? (
-          <View style={styles.errorWrap}>
-            <MaterialIcons color={colors.error} name="error-outline" size={15} />
-            <Text style={styles.errorText}>{panelError}</Text>
-          </View>
-        ) : null}
-
-        {panelNotice ? (
-          <View style={styles.noticeWrap}>
-            <MaterialIcons color={colors.success} name="check-circle" size={15} />
-            <Text style={styles.noticeText}>{panelNotice}</Text>
-          </View>
-        ) : null}
-      </View>
-
-      <View style={styles.boardHeader}>
-        <Text style={styles.boardTitle}>Claim Inbox</Text>
-      </View>
-
-      {incomingClaims.length ? (
-        incomingClaims.slice(0, compact ? 1 : 3).map((claim) => (
-          <View key={claim.id} style={styles.claimCard}>
-            <View style={styles.claimHeaderRow}>
-              <Text numberOfLines={1} style={styles.claimTitle}>
-                {claim.found_item.title}
-              </Text>
-              <Text style={styles.claimScore}>{claim.match_score}% match</Text>
+      {showComposerSections ? (
+        <>
+          <View style={compact ? styles.quickWidgetsRowCompact : styles.quickWidgetsRow}>
+            <View style={styles.quickWidgetCard}>
+              <Text style={styles.quickWidgetLabel}>Open Lost</Text>
+              <Text style={styles.quickWidgetValue}>{quickWidgetMetrics.openLostCount}</Text>
             </View>
 
-            <Text numberOfLines={1} style={styles.claimMetaText}>
-              Requested by owner {formatRelativeTime(claim.created_at)}
+            <View style={styles.quickWidgetCard}>
+              <Text style={styles.quickWidgetLabel}>Pending Claims</Text>
+              <Text style={styles.quickWidgetValue}>{quickWidgetMetrics.pendingClaimsCount}</Text>
+            </View>
+
+            {!compact ? (
+              <View style={styles.quickWidgetCard}>
+                <Text style={styles.quickWidgetLabel}>Recent Rewards</Text>
+                <Text style={styles.quickWidgetValue}>{quickWidgetMetrics.recentRewards}</Text>
+              </View>
+            ) : null}
+          </View>
+
+          <View style={styles.studioCard}>
+            <Text style={styles.studioTitle}>Campus AI Studio</Text>
+            <Text style={styles.studioSubtitle}>
+              Upload from camera/gallery, detect item type, and submit found item, lost report, or claim request instantly.
             </Text>
 
-            {claim.proof_image_url ? (
-              <Image source={{ uri: claim.proof_image_url }} style={styles.claimProofImage} />
+            <View style={styles.studioActionRow}>
+              <Pressable onPress={() => openComposer('lost')} style={styles.primaryAction}>
+                <MaterialIcons color={colors.onPrimary} name="add-photo-alternate" size={16} />
+                <Text style={styles.primaryActionText}>Report Lost Item</Text>
+              </Pressable>
+
+              <Pressable onPress={() => openComposer('claim')} style={styles.secondaryAction}>
+                <MaterialIcons color={colors.primary} name="fact-check" size={16} />
+                <Text style={styles.secondaryActionText}>Start New Claim</Text>
+              </Pressable>
+            </View>
+
+            <Pressable onPress={() => openComposer('found')} style={styles.foundActionButton}>
+              <MaterialIcons color={colors.onPrimary} name="inventory-2" size={16} />
+              <Text style={styles.foundActionButtonText}>Add Found Item</Text>
+            </Pressable>
+
+            {panelError ? (
+              <View style={styles.errorWrap}>
+                <MaterialIcons color={colors.error} name="error-outline" size={15} />
+                <Text style={styles.errorText}>{panelError}</Text>
+              </View>
             ) : null}
 
-            <Text numberOfLines={1} style={styles.claimMetaSubText}>
-              Proof label: {claim.ai_detected_label || 'Manual proof'}
-            </Text>
-
-            <View style={styles.claimActionRow}>
-              <Pressable
-                disabled={Boolean(isResolvingClaimId)}
-                onPress={() => void resolveIncomingClaim(claim.id, 'reject')}
-                style={styles.rejectButton}
-              >
-                <Text style={styles.rejectButtonText}>Reject</Text>
-              </Pressable>
-
-              <Pressable
-                disabled={Boolean(isResolvingClaimId)}
-                onPress={() => void resolveIncomingClaim(claim.id, 'approve')}
-                style={styles.approveButton}
-              >
-                {isResolvingClaimId === claim.id ? (
-                  <ActivityIndicator color={colors.onPrimary} size="small" />
-                ) : (
-                  <Text style={styles.approveButtonText}>Approve + Points</Text>
-                )}
-              </Pressable>
-            </View>
-          </View>
-        ))
-      ) : (
-        <View style={styles.emptyBoardCard}>
-          <MaterialIcons color={colors.outline} name="inbox" size={18} />
-          <Text style={styles.emptyBoardText}>No incoming claims to review.</Text>
-        </View>
-      )}
-
-      {pickupQueue.length ? (
-        <>
-          <View style={styles.boardHeader}>
-            <Text style={styles.boardTitle}>Pickup Confirmation</Text>
-          </View>
-
-          {pickupQueue.map((claim) => (
-            <View key={`pickup-${claim.id}`} style={styles.claimCard}>
-              <View style={styles.claimHeaderRow}>
-                <Text numberOfLines={1} style={styles.claimTitle}>
-                  {claim.found_item.title}
-                </Text>
-                <Text style={styles.claimScore}>Approved</Text>
+            {panelNotice ? (
+              <View style={styles.noticeWrap}>
+                <MaterialIcons color={colors.success} name="check-circle" size={15} />
+                <Text style={styles.noticeText}>{panelNotice}</Text>
               </View>
-
-              <Text numberOfLines={1} style={styles.claimMetaText}>
-                Owner verified. Mark picked up after handover.
-              </Text>
-
-              <Pressable
-                disabled={Boolean(isConfirmingPickupId)}
-                onPress={() => void confirmPickup(claim.id)}
-                style={styles.pickupButton}
-              >
-                {isConfirmingPickupId === claim.id ? (
-                  <ActivityIndicator color={colors.onPrimary} size="small" />
-                ) : (
-                  <Text style={styles.pickupButtonText}>Mark Picked Up</Text>
-                )}
-              </Pressable>
-            </View>
-          ))}
+            ) : null}
+          </View>
         </>
       ) : null}
 
-      <View style={styles.boardHeader}>
-        <Text style={styles.boardTitle}>Claim History</Text>
-      </View>
+      {!showComposerSections && panelError ? (
+        <View style={styles.errorWrap}>
+          <MaterialIcons color={colors.error} name="error-outline" size={15} />
+          <Text style={styles.errorText}>{panelError}</Text>
+        </View>
+      ) : null}
 
-      {claimHistory.length ? (
-        claimHistory.slice(0, compact ? 2 : 5).map((entry) => (
-          <View key={`history-${entry.id}`} style={styles.historyCard}>
-            <View style={styles.historyTopRow}>
-              <Text numberOfLines={1} style={styles.historyTitle}>
-                {entry.found_item.title}
-              </Text>
-              <Text style={styles.historyStatus}>{entry.status.replace('_', ' ')}</Text>
+      {!showComposerSections && panelNotice ? (
+        <View style={styles.noticeWrap}>
+          <MaterialIcons color={colors.success} name="check-circle" size={15} />
+          <Text style={styles.noticeText}>{panelNotice}</Text>
+        </View>
+      ) : null}
+
+      {showClaimOperations ? (
+        <>
+          <View style={styles.claimSectionHeaderCard}>
+            <View>
+              <Text style={styles.boardTitle}>Claim Inbox</Text>
+              <Text style={styles.sectionSupportText}>Owner requests waiting for your review.</Text>
             </View>
-
-            <Text numberOfLines={1} style={styles.historyMeta}>
-              Score {entry.match_score}% • {formatRelativeTime(entry.created_at)}
-            </Text>
+            <View style={styles.sectionCountBadge}>
+              <MaterialIcons color={colors.onPrimary} name="inbox" size={13} />
+              <Text style={styles.sectionCountBadgeText}>{incomingClaims.length}</Text>
+            </View>
           </View>
-        ))
-      ) : (
-        <View style={styles.emptyBoardCard}>
-          <MaterialIcons color={colors.outline} name="history" size={18} />
-          <Text style={styles.emptyBoardText}>No claim history yet.</Text>
-        </View>
-      )}
 
-      <View style={styles.boardHeader}>
-        <Text style={styles.boardTitle}>{compact ? 'Recent Lost Reports' : 'Lost Board'}</Text>
-        {isPanelLoading ? (
-          <ActivityIndicator color={colors.primary} size="small" />
-        ) : (
-          <Pressable onPress={() => void loadPanelData()}>
-            <Text style={styles.boardRefresh}>Refresh</Text>
-          </Pressable>
-        )}
-      </View>
-
-      {lostBoard.length ? (
-        <ScrollView horizontal showsHorizontalScrollIndicator={false}>
-          {lostBoard.slice(0, compact ? 4 : 12).map((item) => (
-            <View key={item.id} style={styles.boardCard}>
-              {item.image_url ? (
-                <Image source={{ uri: item.image_url }} style={styles.boardImage} />
-              ) : (
-                <View style={styles.boardImageFallback}>
-                  <MaterialIcons color={colors.outline} name="photo" size={22} />
+          {incomingClaims.length ? (
+            incomingClaims.slice(0, compact ? 1 : 3).map((claim) => (
+              <View key={claim.id} style={styles.claimCard}>
+                <View style={styles.claimHeaderRow}>
+                  <Text numberOfLines={1} style={styles.claimTitle}>
+                    {claim.found_item.title}
+                  </Text>
+                  <Text style={styles.claimScore}>{claim.match_score}% match</Text>
                 </View>
-              )}
 
-              <Text numberOfLines={1} style={styles.boardItemTitle}>
-                {item.title}
-              </Text>
+                <Text numberOfLines={1} style={styles.claimMetaText}>
+                  Requested by owner {formatRelativeTime(claim.created_at)}
+                </Text>
 
-              <Text numberOfLines={1} style={styles.boardItemLocation}>
-                {item.expected_location || 'Campus area'}
-              </Text>
+                {claim.proof_image_url ? (
+                  <Image source={{ uri: claim.proof_image_url }} style={styles.claimProofImage} />
+                ) : null}
 
-              <View style={styles.boardMetaRow}>
-                <Text style={styles.boardChip}>{item.category}</Text>
-                <Text style={styles.boardAgo}>{formatRelativeTime(item.created_at)}</Text>
+                <Text numberOfLines={1} style={styles.claimMetaSubText}>
+                  Proof label: {claim.ai_detected_label || 'Manual proof'}
+                </Text>
+
+                <View style={styles.claimActionRow}>
+                  <Pressable onPress={() => void openMessages(claim)} style={styles.messageButton}>
+                    <MaterialIcons color={colors.onSurfaceVariant} name="chat-bubble-outline" size={14} />
+                    <Text style={styles.messageButtonText}>Message</Text>
+                  </Pressable>
+
+                  <Pressable
+                    disabled={Boolean(isResolvingClaimId)}
+                    onPress={() => void resolveIncomingClaim(claim.id, 'reject')}
+                    style={styles.rejectButton}
+                  >
+                    <MaterialIcons color={colors.onSurfaceVariant} name="close" size={14} />
+                    <Text style={styles.rejectButtonText}>Reject</Text>
+                  </Pressable>
+
+                  <Pressable
+                    disabled={Boolean(isResolvingClaimId)}
+                    onPress={() => void resolveIncomingClaim(claim.id, 'approve')}
+                    style={styles.approveButton}
+                  >
+                    {isResolvingClaimId === claim.id ? (
+                      <ActivityIndicator color={colors.onPrimary} size="small" />
+                    ) : (
+                      <View style={styles.actionButtonInnerRow}>
+                        <MaterialIcons color={colors.onPrimary} name="verified" size={14} />
+                        <Text style={styles.approveButtonText}>Approve + Points</Text>
+                      </View>
+                    )}
+                  </Pressable>
+                </View>
               </View>
+            ))
+          ) : (
+            <View style={styles.emptyBoardCardLarge}>
+              <View style={styles.emptyStateIconWrap}>
+                <MaterialIcons color={colors.primary} name="inbox" size={22} />
+              </View>
+              <Text style={styles.emptyBoardTitle}>No incoming claims to review</Text>
+              <Text style={styles.emptyBoardSubtitle}>
+                New claim requests will appear here for approve or reject actions.
+              </Text>
+              <Pressable onPress={() => void loadPanelData()} style={styles.emptyBoardActionButton}>
+                <MaterialIcons color={colors.primary} name="refresh" size={14} />
+                <Text style={styles.emptyBoardActionButtonText}>Refresh Inbox</Text>
+              </Pressable>
             </View>
-          ))}
-        </ScrollView>
-      ) : (
-        <View style={styles.emptyBoardCard}>
-          <MaterialIcons color={colors.outline} name="search" size={18} />
-          <Text style={styles.emptyBoardText}>No open lost reports yet.</Text>
+          )}
+
+          {pickupQueue.length ? (
+            <>
+              <View style={styles.claimSectionHeaderCardCompact}>
+                <View>
+                  <Text style={styles.boardTitle}>Pickup Confirmation</Text>
+                  <Text style={styles.sectionSupportText}>Finalize handover after owner verification.</Text>
+                </View>
+                <View style={styles.sectionCountBadgeMuted}>
+                  <MaterialIcons color={colors.primary} name="task-alt" size={13} />
+                  <Text style={styles.sectionCountBadgeMutedText}>{pickupQueue.length}</Text>
+                </View>
+              </View>
+
+              {pickupQueue.map((claim) => (
+                <View key={`pickup-${claim.id}`} style={styles.claimCard}>
+                  <View style={styles.claimHeaderRow}>
+                    <Text numberOfLines={1} style={styles.claimTitle}>
+                      {claim.found_item.title}
+                    </Text>
+                    <Text style={styles.claimScore}>Approved</Text>
+                  </View>
+
+                  <Text numberOfLines={1} style={styles.claimMetaText}>
+                    Owner verified. Mark picked up after handover.
+                  </Text>
+
+                  <View style={styles.claimActionRow}>
+                    <Pressable onPress={() => void openMessages(claim)} style={styles.messageButton}>
+                      <MaterialIcons color={colors.onSurfaceVariant} name="chat-bubble-outline" size={14} />
+                      <Text style={styles.messageButtonText}>Message</Text>
+                    </Pressable>
+
+                    <Pressable
+                      disabled={Boolean(isConfirmingPickupId)}
+                      onPress={() => void confirmPickup(claim.id)}
+                      style={styles.pickupButtonCompact}
+                    >
+                      {isConfirmingPickupId === claim.id ? (
+                        <ActivityIndicator color={colors.onPrimary} size="small" />
+                      ) : (
+                        <View style={styles.actionButtonInnerRow}>
+                          <MaterialIcons color={colors.onPrimary} name="task-alt" size={14} />
+                          <Text style={styles.pickupButtonText}>Mark Picked Up</Text>
+                        </View>
+                      )}
+                    </Pressable>
+                  </View>
+                </View>
+              ))}
+            </>
+          ) : null}
+
+          <View style={styles.claimSectionHeaderCard}>
+            <View>
+              <Text style={styles.boardTitle}>Claim History</Text>
+              <Text style={styles.sectionSupportText}>Track approvals, pickup status, and claim chat.</Text>
+            </View>
+            <View style={styles.sectionCountBadge}>
+              <MaterialIcons color={colors.onPrimary} name="history" size={13} />
+              <Text style={styles.sectionCountBadgeText}>{historyOverview.all}</Text>
+            </View>
+          </View>
+
+          <View style={styles.historyFilterRow}>
+            <Pressable
+              onPress={() => setHistoryFilter('all')}
+              style={[styles.historyFilterChip, historyFilter === 'all' ? styles.historyFilterChipActive : undefined]}
+            >
+              <MaterialIcons
+                color={historyFilter === 'all' ? colors.onPrimary : colors.onSurfaceVariant}
+                name="view-list"
+                size={14}
+              />
+              <Text
+                style={[
+                  styles.historyFilterText,
+                  historyFilter === 'all' ? styles.historyFilterTextActive : undefined,
+                ]}
+              >
+                ALL ({historyOverview.all})
+              </Text>
+            </Pressable>
+
+            <Pressable
+              onPress={() => setHistoryFilter('active')}
+              style={[styles.historyFilterChip, historyFilter === 'active' ? styles.historyFilterChipActive : undefined]}
+            >
+              <MaterialIcons
+                color={historyFilter === 'active' ? colors.onPrimary : colors.onSurfaceVariant}
+                name="autorenew"
+                size={14}
+              />
+              <Text
+                style={[
+                  styles.historyFilterText,
+                  historyFilter === 'active' ? styles.historyFilterTextActive : undefined,
+                ]}
+              >
+                ACTIVE ({historyOverview.active})
+              </Text>
+            </Pressable>
+
+            <Pressable
+              onPress={() => setHistoryFilter('completed')}
+              style={[
+                styles.historyFilterChip,
+                historyFilter === 'completed' ? styles.historyFilterChipActive : undefined,
+              ]}
+            >
+              <MaterialIcons
+                color={historyFilter === 'completed' ? colors.onPrimary : colors.onSurfaceVariant}
+                name="task-alt"
+                size={14}
+              />
+              <Text
+                style={[
+                  styles.historyFilterText,
+                  historyFilter === 'completed' ? styles.historyFilterTextActive : undefined,
+                ]}
+              >
+                COMPLETED ({historyOverview.completed})
+              </Text>
+            </Pressable>
+          </View>
+
+          {filteredHistory.length ? (
+            filteredHistory.map((entry) => {
+              const statusTone = resolveStatusTone(entry.status);
+              const isOwner = safeString(entry.found_item.created_by) === currentUserId;
+              const isClaimant = safeString(entry.claimant_user_id) === currentUserId;
+              const canMessage = entry.status !== 'picked_up';
+              const canUndoPickup =
+                isOwner &&
+                entry.status === 'picked_up' &&
+                (entry.pickup_is_editable || entry.pickup_edit_seconds_remaining > 0);
+              const isFocusedHistoryEntry =
+                Boolean(focusedHistoryClaimId) && entry.id === focusedHistoryClaimId;
+
+              return (
+                <View
+                  key={`history-${entry.id}`}
+                  style={[styles.historyCard, isFocusedHistoryEntry ? styles.historyCardFocused : undefined]}
+                >
+                  {isFocusedHistoryEntry ? (
+                    <View style={styles.focusedClaimTag}>
+                      <MaterialIcons color={colors.primary} name="stars" size={13} />
+                      <Text style={styles.focusedClaimTagText}>CURRENT APPROVED CLAIM</Text>
+                    </View>
+                  ) : null}
+
+                  <View style={styles.historyTopRow}>
+                    <Text numberOfLines={1} style={styles.historyTitle}>
+                      {entry.found_item.title}
+                    </Text>
+                    <Text style={[styles.historyStatus, { backgroundColor: statusTone.bg, color: statusTone.fg }]}>
+                      {formatStatusLabel(entry.status)}
+                    </Text>
+                  </View>
+
+                  <Text numberOfLines={1} style={styles.historyMeta}>
+                    Score {entry.match_score}% • {formatRelativeTime(entry.created_at)}
+                  </Text>
+
+                  <Text numberOfLines={1} style={styles.historyMeta}>
+                    {isOwner ? 'You are uploader' : isClaimant ? 'You are claimant' : 'Claim participant'}
+                  </Text>
+
+                  {entry.reviewed_at ? (
+                    <Text numberOfLines={1} style={styles.historyMeta}>
+                      Reviewed {formatRelativeTime(entry.reviewed_at)}
+                    </Text>
+                  ) : null}
+
+                  {entry.status === 'picked_up' && entry.pickup_confirmed_at ? (
+                    <Text numberOfLines={1} style={styles.historyMeta}>
+                      Picked up {formatRelativeTime(entry.pickup_confirmed_at)}
+                    </Text>
+                  ) : null}
+
+                  {entry.proof_image_url ? (
+                    <Image source={{ uri: entry.proof_image_url }} style={styles.historyProofImage} />
+                  ) : null}
+
+                  {(canMessage || canUndoPickup || (isOwner && entry.status === 'approved')) ? (
+                    <View style={styles.historyActionsRow}>
+                      {canMessage ? (
+                        <Pressable onPress={() => void openMessages(entry)} style={styles.messageButton}>
+                          <MaterialIcons color={colors.onSurfaceVariant} name="chat-bubble-outline" size={14} />
+                          <Text style={styles.messageButtonText}>Message</Text>
+                        </Pressable>
+                      ) : null}
+
+                      {isOwner && entry.status === 'approved' ? (
+                        <Pressable
+                          disabled={Boolean(isConfirmingPickupId)}
+                          onPress={() => void confirmPickup(entry.id)}
+                          style={styles.pickupButtonCompact}
+                        >
+                          {isConfirmingPickupId === entry.id ? (
+                            <ActivityIndicator color={colors.onPrimary} size="small" />
+                          ) : (
+                            <View style={styles.actionButtonInnerRow}>
+                              <MaterialIcons color={colors.onPrimary} name="task-alt" size={14} />
+                              <Text style={styles.pickupButtonText}>Mark Picked Up</Text>
+                            </View>
+                          )}
+                        </Pressable>
+                      ) : null}
+
+                      {canUndoPickup ? (
+                        <Pressable
+                          disabled={Boolean(isRevertingPickupId)}
+                          onPress={() => void revertPickup(entry.id)}
+                          style={styles.undoPickupButton}
+                        >
+                          {isRevertingPickupId === entry.id ? (
+                            <ActivityIndicator color={colors.primary} size="small" />
+                          ) : (
+                            <View style={styles.actionButtonInnerRow}>
+                              <MaterialIcons color={colors.primary} name="undo" size={14} />
+                              <Text style={styles.undoPickupButtonText}>
+                                Undo ({minutesLeft(entry.pickup_edit_seconds_remaining)}m)
+                              </Text>
+                            </View>
+                          )}
+                        </Pressable>
+                      ) : null}
+                    </View>
+                  ) : null}
+                </View>
+              );
+            })
+          ) : (
+            <View style={styles.emptyBoardCardLarge}>
+              <View style={styles.emptyStateIconWrap}>
+                <MaterialIcons color={colors.primary} name="history" size={22} />
+              </View>
+              <Text style={styles.emptyBoardTitle}>Claim history is empty</Text>
+              <Text style={styles.emptyBoardSubtitle}>{historyEmptySubtitle}</Text>
+              <Pressable
+                onPress={() => {
+                  setHistoryFilter('all');
+                  void loadPanelData();
+                }}
+                style={styles.emptyBoardActionButton}
+              >
+                <MaterialIcons color={colors.primary} name="refresh" size={14} />
+                <Text style={styles.emptyBoardActionButtonText}>Refresh History</Text>
+              </Pressable>
+            </View>
+          )}
+        </>
+      ) : null}
+
+      {showLostBoard ? (
+        <>
+          <View style={styles.boardHeader}>
+            <Text style={styles.boardTitle}>{compact ? 'Recent Lost Reports' : 'Lost Board'}</Text>
+            {isPanelLoading ? (
+              <ActivityIndicator color={colors.primary} size="small" />
+            ) : (
+              <Pressable onPress={() => void loadPanelData()}>
+                <Text style={styles.boardRefresh}>Refresh</Text>
+              </Pressable>
+            )}
+          </View>
+
+          {lostBoard.length ? (
+            <ScrollView horizontal showsHorizontalScrollIndicator={false}>
+              {lostBoard.slice(0, compact ? 4 : 12).map((item) => (
+                <View key={item.id} style={styles.boardCard}>
+                  {item.image_url ? (
+                    <Image source={{ uri: item.image_url }} style={styles.boardImage} />
+                  ) : (
+                    <View style={styles.boardImageFallback}>
+                      <MaterialIcons color={colors.outline} name="photo" size={22} />
+                    </View>
+                  )}
+
+                  <Text numberOfLines={1} style={styles.boardItemTitle}>
+                    {item.title}
+                  </Text>
+
+                  <Text numberOfLines={1} style={styles.boardItemLocation}>
+                    {item.expected_location || 'Campus area'}
+                  </Text>
+
+                  <View style={styles.boardMetaRow}>
+                    <Text style={styles.boardChip}>{item.category}</Text>
+                    <Text style={styles.boardAgo}>{formatRelativeTime(item.created_at)}</Text>
+                  </View>
+                </View>
+              ))}
+            </ScrollView>
+          ) : (
+            <View style={styles.emptyBoardCard}>
+              <MaterialIcons color={colors.outline} name="search" size={18} />
+              <Text style={styles.emptyBoardText}>No open lost reports yet.</Text>
+            </View>
+          )}
+        </>
+      ) : null}
+
+      <Modal animationType="fade" transparent visible={pickupNotice.visible}>
+        <View style={styles.modalBackdropCenter}>
+          <View style={styles.infoModalCard}>
+            <Text style={styles.infoModalTitle}>Pickup Marked</Text>
+            <Text style={styles.infoModalText}>
+              You can change this status for the next 5 minutes.
+            </Text>
+            <Text style={styles.infoModalTextMuted}>
+              Time left: {minutesLeft(pickupNotice.secondsRemaining)} minute(s)
+            </Text>
+
+            <View style={styles.infoModalActionsRow}>
+              <Pressable
+                onPress={() =>
+                  setPickupNotice({
+                    visible: false,
+                    claimId: '',
+                    secondsRemaining: 0,
+                  })
+                }
+                style={styles.infoModalSecondaryAction}
+              >
+                <Text style={styles.infoModalSecondaryActionText}>Keep</Text>
+              </Pressable>
+
+              <Pressable
+                disabled={Boolean(isRevertingPickupId)}
+                onPress={() => void revertPickup(pickupNotice.claimId)}
+                style={styles.infoModalPrimaryAction}
+              >
+                {isRevertingPickupId === pickupNotice.claimId ? (
+                  <ActivityIndicator color={colors.onPrimary} size="small" />
+                ) : (
+                  <Text style={styles.infoModalPrimaryActionText}>Undo Pickup</Text>
+                )}
+              </Pressable>
+            </View>
+          </View>
         </View>
-      )}
+      </Modal>
+
+      <Modal animationType="slide" transparent visible={isMessagesModalVisible}>
+        <View style={styles.modalBackdrop}>
+          <View style={styles.messagesSheet}>
+            <View style={styles.modalHeader}>
+              <Text style={styles.modalTitle}>Claim Messages</Text>
+              <Pressable
+                onPress={() => {
+                  setIsMessagesModalVisible(false);
+                  setMessagesClaim(null);
+                  setMessagesError('');
+                }}
+              >
+                <MaterialIcons color={colors.onSurfaceVariant} name="close" size={24} />
+              </Pressable>
+            </View>
+
+            <Text numberOfLines={1} style={styles.messagesItemTitle}>
+              {messagesClaim?.found_item.title || 'Claim thread'}
+            </Text>
+
+            {isMessagesLoading ? (
+              <View style={styles.messagesLoadingWrap}>
+                <ActivityIndicator color={colors.primary} size="small" />
+                <Text style={styles.messagesLoadingText}>Loading messages...</Text>
+              </View>
+            ) : (
+              <ScrollView style={styles.messagesScroll}>
+                {messages.length ? (
+                  messages.map((entry) => {
+                    const mine = safeString(entry.sender_user_id) === currentUserId;
+
+                    return (
+                      <View
+                        key={`${entry.id}-${entry.created_at || 'now'}`}
+                        style={[styles.messageBubble, mine ? styles.messageBubbleMine : styles.messageBubbleOther]}
+                      >
+                        <Text style={styles.messageBubbleText}>{entry.message_text}</Text>
+                        <Text style={styles.messageBubbleMeta}>{formatRelativeTime(entry.created_at)}</Text>
+                      </View>
+                    );
+                  })
+                ) : (
+                  <View style={styles.emptyBoardCard}>
+                    <MaterialIcons color={colors.outline} name="chat-bubble-outline" size={18} />
+                    <Text style={styles.emptyBoardText}>No messages yet.</Text>
+                  </View>
+                )}
+              </ScrollView>
+            )}
+
+            {messagesError ? (
+              <View style={styles.errorWrap}>
+                <MaterialIcons color={colors.error} name="error-outline" size={15} />
+                <Text style={styles.errorText}>{messagesError}</Text>
+              </View>
+            ) : null}
+
+            {isMessagingActive ? (
+              <View style={styles.messagesComposerRow}>
+                <TextInput
+                  onChangeText={setMessagesInput}
+                  placeholder="Type a message"
+                  placeholderTextColor={colors.outline}
+                  style={styles.messagesInput}
+                  value={messagesInput}
+                />
+
+                <Pressable
+                  disabled={isSendingMessage || !messagesInput.trim().length}
+                  onPress={() => void sendMessage()}
+                  style={styles.messagesSendButton}
+                >
+                  {isSendingMessage ? (
+                    <ActivityIndicator color={colors.onPrimary} size="small" />
+                  ) : (
+                    <Text style={styles.messagesSendButtonText}>Send</Text>
+                  )}
+                </Pressable>
+              </View>
+            ) : (
+              <View style={styles.noticeWrap}>
+                <MaterialIcons color={colors.success} name="lock" size={15} />
+                <Text style={styles.noticeText}>Messaging is closed after pickup is marked.</Text>
+              </View>
+            )}
+          </View>
+        </View>
+      </Modal>
 
       <Modal animationType="slide" transparent visible={isModalVisible}>
         <View style={styles.modalBackdrop}>
           <View style={styles.modalSheet}>
             <View style={styles.modalHeader}>
               <Text style={styles.modalTitle}>
-                {mode === 'lost' ? 'Report Lost Product' : 'Claim Product With Proof'}
+                {mode === 'lost'
+                  ? 'Report Lost Product'
+                  : mode === 'found'
+                    ? 'Add Found Product'
+                    : 'Start New Claim'}
               </Text>
               <Pressable onPress={closeComposer}>
                 <MaterialIcons color={colors.onSurfaceVariant} name="close" size={24} />
@@ -1248,6 +2059,13 @@ export function CampusActionStudio({
             <ScrollView showsVerticalScrollIndicator={false}>
               {mode === 'claim' ? (
                 <>
+                  <View style={styles.claimFlowHintCard}>
+                    <MaterialIcons color={colors.primary} name="info-outline" size={15} />
+                    <Text style={styles.claimFlowHintText}>
+                      Use this for new claims only. If your claim is already approved, continue in the History tab.
+                    </Text>
+                  </View>
+
                   <Text style={styles.inputLabel}>Select Found Product</Text>
 
                   {claimableItems.length ? (
@@ -1301,7 +2119,7 @@ export function CampusActionStudio({
 
                   {selectedClaimItem ? (
                     <Text numberOfLines={2} style={styles.selectedTargetHint}>
-                      Claiming: {selectedClaimItem.title} • {selectedClaimItem.location}
+                      Selected item: {selectedClaimItem.title} • {selectedClaimItem.location}
                     </Text>
                   ) : null}
                 </>
@@ -1361,14 +2179,16 @@ export function CampusActionStudio({
                 placeholder={
                   mode === 'lost'
                     ? 'Add unique details so owner can identify...'
-                    : 'Add ownership proof details...'
+                    : mode === 'found'
+                      ? 'Add details that help owner verify this item...'
+                      : 'Add ownership proof details...'
                 }
                 placeholderTextColor={colors.outline}
                 style={styles.inputMultiline}
                 value={description}
               />
 
-              <Text style={styles.inputLabel}>Location Hint</Text>
+              <Text style={styles.inputLabel}>{mode === 'found' ? 'Found Location' : 'Location Hint'}</Text>
               <TextInput
                 onChangeText={setLocationHint}
                 placeholder="e.g., Main Library, Block B"
@@ -1393,7 +2213,15 @@ export function CampusActionStudio({
 
               <Pressable
                 disabled={isWorking || isClaimSubmitBlocked}
-                onPress={() => void (mode === 'lost' ? submitLostReport() : submitAutoClaim())}
+                onPress={() =>
+                  void (
+                    mode === 'lost'
+                      ? submitLostReport()
+                      : mode === 'found'
+                        ? submitFoundItem()
+                        : submitAutoClaim()
+                  )
+                }
                 style={[
                   styles.submitButton,
                   isWorking || isClaimSubmitBlocked ? styles.submitButtonDisabled : undefined,
@@ -1405,13 +2233,15 @@ export function CampusActionStudio({
                   <>
                     <MaterialIcons
                       color={colors.onPrimary}
-                      name={mode === 'lost' ? 'upload' : 'verified-user'}
+                      name={mode === 'claim' ? 'verified-user' : 'upload'}
                       size={17}
                     />
                     <Text style={styles.submitButtonText}>
                       {mode === 'lost'
                         ? 'Submit Lost Product'
-                        : 'Submit Claim Request'}
+                        : mode === 'found'
+                          ? 'Submit Found Product'
+                          : 'Send Claim Proof'}
                     </Text>
                   </>
                 )}
@@ -1596,16 +2426,96 @@ const styles = StyleSheet.create({
     fontSize: 12,
     marginLeft: 5,
   },
+  foundActionButton: {
+    alignItems: 'center',
+    backgroundColor: '#274890',
+    borderRadius: radii.md,
+    flexDirection: 'row',
+    justifyContent: 'center',
+    marginTop: 8,
+    paddingVertical: 10,
+  },
+  foundActionButtonText: {
+    color: colors.onPrimary,
+    fontFamily: fontFamily.bodySemiBold,
+    fontSize: 12,
+    marginLeft: 5,
+  },
   boardHeader: {
     alignItems: 'center',
     flexDirection: 'row',
     justifyContent: 'space-between',
     marginBottom: 8,
   },
+  claimSectionHeaderCard: {
+    ...shadows.soft,
+    alignItems: 'center',
+    backgroundColor: '#EEF4FF',
+    borderColor: '#CBDCFF',
+    borderRadius: radii.md,
+    borderWidth: 1,
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    marginBottom: 10,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+  },
+  claimSectionHeaderCardCompact: {
+    ...shadows.soft,
+    alignItems: 'center',
+    backgroundColor: '#F4F8FF',
+    borderColor: '#E0E8FF',
+    borderRadius: radii.md,
+    borderWidth: 1,
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    marginBottom: 10,
+    paddingHorizontal: 12,
+    paddingVertical: 9,
+  },
   boardTitle: {
     color: colors.primary,
     fontFamily: fontFamily.headlineBold,
     fontSize: 19,
+  },
+  sectionSupportText: {
+    color: colors.onSurfaceVariant,
+    fontFamily: fontFamily.headlineSemiBold,
+    fontSize: 12,
+    lineHeight: 16,
+    marginTop: 3,
+  },
+  sectionCountBadge: {
+    alignItems: 'center',
+    backgroundColor: colors.primary,
+    borderRadius: radii.pill,
+    flexDirection: 'row',
+    justifyContent: 'center',
+    minWidth: 34,
+    paddingHorizontal: 9,
+    paddingVertical: 6,
+  },
+  sectionCountBadgeText: {
+    color: colors.onPrimary,
+    fontFamily: fontFamily.bodySemiBold,
+    fontSize: 12,
+    marginLeft: 4,
+  },
+  sectionCountBadgeMuted: {
+    alignItems: 'center',
+    backgroundColor: '#E2EBFF',
+    borderRadius: radii.pill,
+    flexDirection: 'row',
+    justifyContent: 'center',
+    minWidth: 34,
+    paddingHorizontal: 9,
+    paddingVertical: 6,
+  },
+  sectionCountBadgeMutedText: {
+    color: colors.primary,
+    fontFamily: fontFamily.bodySemiBold,
+    fontSize: 12,
+    marginLeft: 4,
   },
   boardRefresh: {
     color: colors.onSurfaceVariant,
@@ -1619,8 +2529,8 @@ const styles = StyleSheet.create({
     borderColor: 'rgba(118, 118, 131, 0.18)',
     borderRadius: radii.md,
     borderWidth: 1,
-    marginBottom: 8,
-    padding: 10,
+    marginBottom: 10,
+    padding: 11,
   },
   claimHeaderRow: {
     alignItems: 'center',
@@ -1635,20 +2545,25 @@ const styles = StyleSheet.create({
     marginRight: 6,
   },
   claimScore: {
+    backgroundColor: '#E8EEFF',
+    borderRadius: radii.pill,
     color: colors.primary,
     fontFamily: fontFamily.bodySemiBold,
     fontSize: 11,
+    overflow: 'hidden',
+    paddingHorizontal: 8,
+    paddingVertical: 4,
     textTransform: 'uppercase',
   },
   claimMetaText: {
     color: colors.onSurfaceVariant,
-    fontFamily: fontFamily.bodyMedium,
+    fontFamily: fontFamily.headlineSemiBold,
     fontSize: 12,
     marginTop: 5,
   },
   claimMetaSubText: {
     color: colors.outline,
-    fontFamily: fontFamily.bodyMedium,
+    fontFamily: fontFamily.headlineSemiBold,
     fontSize: 11,
     marginTop: 5,
   },
@@ -1659,23 +2574,48 @@ const styles = StyleSheet.create({
     width: '100%',
   },
   claimActionRow: {
+    alignItems: 'center',
     flexDirection: 'row',
     justifyContent: 'flex-end',
     marginTop: 9,
+  },
+  actionButtonInnerRow: {
+    alignItems: 'center',
+    flexDirection: 'row',
+  },
+  messageButton: {
+    alignItems: 'center',
+    backgroundColor: colors.surfaceLow,
+    borderRadius: radii.pill,
+    flexDirection: 'row',
+    justifyContent: 'center',
+    marginRight: 8,
+    minWidth: 84,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+  },
+  messageButtonText: {
+    color: colors.onSurfaceVariant,
+    fontFamily: fontFamily.bodySemiBold,
+    fontSize: 12,
+    marginLeft: 4,
   },
   rejectButton: {
     alignItems: 'center',
     backgroundColor: '#F0F2F4',
     borderRadius: radii.pill,
+    flexDirection: 'row',
     justifyContent: 'center',
     marginRight: 8,
     minWidth: 84,
+    paddingHorizontal: 10,
     paddingVertical: 8,
   },
   rejectButtonText: {
     color: colors.onSurfaceVariant,
     fontFamily: fontFamily.bodySemiBold,
     fontSize: 12,
+    marginLeft: 4,
   },
   approveButton: {
     alignItems: 'center',
@@ -1690,6 +2630,7 @@ const styles = StyleSheet.create({
     color: colors.onPrimary,
     fontFamily: fontFamily.bodySemiBold,
     fontSize: 12,
+    marginLeft: 4,
   },
   pickupButton: {
     alignItems: 'center',
@@ -1700,18 +2641,84 @@ const styles = StyleSheet.create({
     minHeight: 36,
     paddingHorizontal: 10,
   },
+  pickupButtonCompact: {
+    alignItems: 'center',
+    backgroundColor: colors.primary,
+    borderRadius: radii.pill,
+    justifyContent: 'center',
+    minHeight: 36,
+    minWidth: 132,
+    paddingHorizontal: 10,
+  },
   pickupButtonText: {
     color: colors.onPrimary,
     fontFamily: fontFamily.bodySemiBold,
     fontSize: 12,
+    marginLeft: 4,
+  },
+  historyFilterRow: {
+    backgroundColor: '#F4F6FB',
+    borderRadius: radii.pill,
+    flexDirection: 'row',
+    marginBottom: 10,
+    padding: 4,
+  },
+  historyFilterChip: {
+    alignItems: 'center',
+    backgroundColor: 'transparent',
+    borderColor: 'transparent',
+    borderRadius: radii.pill,
+    borderWidth: 1,
+    flex: 1,
+    marginRight: 6,
+    flexDirection: 'row',
+    justifyContent: 'center',
+    paddingHorizontal: 8,
+    paddingVertical: 8,
+  },
+  historyFilterChipActive: {
+    backgroundColor: colors.primary,
+    borderColor: colors.primary,
+  },
+  historyFilterText: {
+    color: colors.onSurfaceVariant,
+    fontFamily: fontFamily.bodySemiBold,
+    fontSize: 10,
+    marginLeft: 4,
+    textTransform: 'uppercase',
+  },
+  historyFilterTextActive: {
+    color: colors.onPrimary,
   },
   historyCard: {
     backgroundColor: colors.surface,
     borderColor: 'rgba(118, 118, 131, 0.16)',
     borderRadius: radii.md,
     borderWidth: 1,
-    marginBottom: 8,
-    padding: 10,
+    marginBottom: 10,
+    padding: 11,
+  },
+  historyCardFocused: {
+    backgroundColor: '#F1F6FF',
+    borderColor: colors.primary,
+    borderWidth: 2,
+  },
+  focusedClaimTag: {
+    alignItems: 'center',
+    alignSelf: 'flex-start',
+    backgroundColor: '#DDE8FF',
+    borderRadius: radii.pill,
+    flexDirection: 'row',
+    marginBottom: 7,
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+  },
+  focusedClaimTagText: {
+    color: colors.primary,
+    fontFamily: fontFamily.bodySemiBold,
+    fontSize: 10,
+    marginLeft: 4,
+    textTransform: 'uppercase',
   },
   historyTopRow: {
     alignItems: 'center',
@@ -1726,16 +2733,93 @@ const styles = StyleSheet.create({
     marginRight: 8,
   },
   historyStatus: {
-    color: colors.primary,
+    borderRadius: radii.pill,
     fontFamily: fontFamily.bodySemiBold,
     fontSize: 10,
+    overflow: 'hidden',
+    paddingHorizontal: 8,
+    paddingVertical: 4,
     textTransform: 'uppercase',
   },
   historyMeta: {
     color: colors.onSurfaceVariant,
-    fontFamily: fontFamily.bodyMedium,
+    fontFamily: fontFamily.headlineSemiBold,
     fontSize: 11,
     marginTop: 4,
+  },
+  historyProofImage: {
+    borderRadius: 10,
+    height: 108,
+    marginTop: 7,
+    width: '100%',
+  },
+  historyActionsRow: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    marginTop: 8,
+  },
+  undoPickupButton: {
+    alignItems: 'center',
+    backgroundColor: '#EBF1FF',
+    borderRadius: radii.pill,
+    flexDirection: 'row',
+    justifyContent: 'center',
+    minHeight: 36,
+    paddingHorizontal: 10,
+    marginLeft: 8,
+  },
+  undoPickupButtonText: {
+    color: colors.primary,
+    fontFamily: fontFamily.bodySemiBold,
+    fontSize: 12,
+    marginLeft: 4,
+  },
+  emptyBoardCardLarge: {
+    alignItems: 'center',
+    backgroundColor: '#F7FAFF',
+    borderColor: '#DAE6FA',
+    borderRadius: radii.md,
+    borderWidth: 1,
+    paddingHorizontal: 14,
+    paddingVertical: 16,
+  },
+  emptyStateIconWrap: {
+    alignItems: 'center',
+    backgroundColor: '#E4EEFF',
+    borderRadius: 20,
+    height: 40,
+    justifyContent: 'center',
+    width: 40,
+  },
+  emptyBoardTitle: {
+    color: colors.primary,
+    fontFamily: fontFamily.headlineSemiBold,
+    fontSize: 15,
+    marginTop: 8,
+  },
+  emptyBoardSubtitle: {
+    color: colors.onSurfaceVariant,
+    fontFamily: fontFamily.headlineSemiBold,
+    fontSize: 12,
+    lineHeight: 17,
+    marginTop: 4,
+    textAlign: 'center',
+  },
+  emptyBoardActionButton: {
+    alignItems: 'center',
+    backgroundColor: '#E3ECFF',
+    borderRadius: radii.pill,
+    flexDirection: 'row',
+    marginTop: 10,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+  },
+  emptyBoardActionButtonText: {
+    color: colors.primary,
+    fontFamily: fontFamily.bodySemiBold,
+    fontSize: 11,
+    marginLeft: 5,
+    textTransform: 'uppercase',
   },
   boardCard: {
     backgroundColor: colors.surface,
@@ -1815,6 +2899,70 @@ const styles = StyleSheet.create({
     flex: 1,
     justifyContent: 'flex-end',
   },
+  modalBackdropCenter: {
+    alignItems: 'center',
+    backgroundColor: 'rgba(0, 0, 0, 0.44)',
+    flex: 1,
+    justifyContent: 'center',
+    paddingHorizontal: 22,
+  },
+  infoModalCard: {
+    backgroundColor: colors.surface,
+    borderRadius: radii.lg,
+    padding: 14,
+    width: '100%',
+  },
+  infoModalTitle: {
+    color: colors.primary,
+    fontFamily: fontFamily.headlineBold,
+    fontSize: 20,
+  },
+  infoModalText: {
+    color: colors.onSurface,
+    fontFamily: fontFamily.bodyMedium,
+    fontSize: 13,
+    marginTop: 6,
+  },
+  infoModalTextMuted: {
+    color: colors.onSurfaceVariant,
+    fontFamily: fontFamily.bodySemiBold,
+    fontSize: 11,
+    marginTop: 4,
+    textTransform: 'uppercase',
+  },
+  infoModalActionsRow: {
+    flexDirection: 'row',
+    marginTop: 14,
+  },
+  infoModalSecondaryAction: {
+    alignItems: 'center',
+    backgroundColor: colors.surfaceLow,
+    borderRadius: radii.pill,
+    flex: 1,
+    justifyContent: 'center',
+    marginRight: 8,
+    minHeight: 38,
+  },
+  infoModalSecondaryActionText: {
+    color: colors.onSurfaceVariant,
+    fontFamily: fontFamily.bodySemiBold,
+    fontSize: 12,
+    textTransform: 'uppercase',
+  },
+  infoModalPrimaryAction: {
+    alignItems: 'center',
+    backgroundColor: colors.primary,
+    borderRadius: radii.pill,
+    flex: 1,
+    justifyContent: 'center',
+    minHeight: 38,
+  },
+  infoModalPrimaryActionText: {
+    color: colors.onPrimary,
+    fontFamily: fontFamily.bodySemiBold,
+    fontSize: 12,
+    textTransform: 'uppercase',
+  },
   modalSheet: {
     backgroundColor: colors.background,
     borderTopLeftRadius: 20,
@@ -1833,6 +2981,96 @@ const styles = StyleSheet.create({
     color: colors.primary,
     fontFamily: fontFamily.headlineBold,
     fontSize: 20,
+  },
+  messagesSheet: {
+    backgroundColor: colors.background,
+    borderTopLeftRadius: 20,
+    borderTopRightRadius: 20,
+    maxHeight: '88%',
+    minHeight: '64%',
+    paddingHorizontal: 16,
+    paddingTop: 14,
+  },
+  messagesItemTitle: {
+    color: colors.onSurface,
+    fontFamily: fontFamily.headlineSemiBold,
+    fontSize: 13,
+    marginBottom: 8,
+  },
+  messagesLoadingWrap: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    justifyContent: 'center',
+    paddingVertical: 16,
+  },
+  messagesLoadingText: {
+    color: colors.onSurfaceVariant,
+    fontFamily: fontFamily.bodyMedium,
+    marginLeft: 7,
+  },
+  messagesScroll: {
+    marginBottom: 10,
+    maxHeight: 300,
+  },
+  messageBubble: {
+    borderRadius: 12,
+    marginBottom: 8,
+    maxWidth: '88%',
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+  },
+  messageBubbleMine: {
+    alignSelf: 'flex-end',
+    backgroundColor: '#DCE7FF',
+  },
+  messageBubbleOther: {
+    alignSelf: 'flex-start',
+    backgroundColor: colors.surfaceLow,
+  },
+  messageBubbleText: {
+    color: colors.onSurface,
+    fontFamily: fontFamily.bodyMedium,
+    fontSize: 13,
+  },
+  messageBubbleMeta: {
+    color: colors.outline,
+    fontFamily: fontFamily.bodySemiBold,
+    fontSize: 10,
+    marginTop: 4,
+    textTransform: 'uppercase',
+  },
+  messagesComposerRow: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    marginBottom: 18,
+  },
+  messagesInput: {
+    backgroundColor: colors.surface,
+    borderColor: colors.surfaceHigh,
+    borderRadius: radii.md,
+    borderWidth: 1,
+    color: colors.onSurface,
+    flex: 1,
+    fontFamily: fontFamily.bodyMedium,
+    fontSize: 13,
+    minHeight: 40,
+    paddingHorizontal: 10,
+  },
+  messagesSendButton: {
+    alignItems: 'center',
+    backgroundColor: colors.primary,
+    borderRadius: radii.pill,
+    justifyContent: 'center',
+    marginLeft: 8,
+    minHeight: 38,
+    minWidth: 82,
+    paddingHorizontal: 10,
+  },
+  messagesSendButtonText: {
+    color: colors.onPrimary,
+    fontFamily: fontFamily.bodySemiBold,
+    fontSize: 12,
+    textTransform: 'uppercase',
   },
   claimTargetList: {
     paddingBottom: 2,
@@ -1875,6 +3113,24 @@ const styles = StyleSheet.create({
     fontSize: 12,
     marginBottom: 4,
     marginTop: 8,
+  },
+  claimFlowHintCard: {
+    alignItems: 'center',
+    backgroundColor: '#EAF1FF',
+    borderColor: '#D2DEFF',
+    borderRadius: radii.md,
+    borderWidth: 1,
+    flexDirection: 'row',
+    marginTop: 2,
+    paddingHorizontal: 10,
+    paddingVertical: 9,
+  },
+  claimFlowHintText: {
+    color: colors.primary,
+    flex: 1,
+    fontFamily: fontFamily.bodySemiBold,
+    fontSize: 11,
+    marginLeft: 6,
   },
   emptySelectionCard: {
     alignItems: 'center',

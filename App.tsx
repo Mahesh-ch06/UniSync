@@ -28,6 +28,7 @@ import { SafeAreaProvider } from 'react-native-safe-area-context';
 import { backendEnv, isBackendConfigured, missingEnvKeys } from './src/config/env';
 import { AuthScreen } from './src/screens/AuthScreen';
 import { HomeScreen } from './src/screens/HomeScreen';
+import { HistoryScreen } from './src/screens/HistoryScreen';
 import { MapScreen } from './src/screens/MapScreen';
 import { ProfileScreen } from './src/screens/ProfileScreen';
 import { ReportScreen } from './src/screens/ReportScreen';
@@ -39,6 +40,12 @@ type RootTabsParamList = {
   Home: undefined;
   Map: undefined;
   Report: undefined;
+  History: {
+    focusRequestId?: string;
+    focusFoundItemId?: string;
+    focusNonce?: number;
+    autoOpenMessages?: boolean;
+  } | undefined;
   Profile: undefined;
 };
 
@@ -48,6 +55,7 @@ const tabIcons: Record<keyof RootTabsParamList, keyof typeof MaterialIcons.glyph
   Home: 'home',
   Map: 'map',
   Report: 'add-circle',
+  History: 'history',
   Profile: 'person',
 };
 
@@ -55,6 +63,7 @@ const tabLabels: Record<keyof RootTabsParamList, string> = {
   Home: 'Home',
   Map: 'Map',
   Report: 'Report',
+  History: 'History',
   Profile: 'Profile',
 };
 
@@ -103,6 +112,13 @@ function AppTabs() {
         name="Report"
         options={{
           tabBarLabel: tabLabels.Report,
+        }}
+      />
+      <Tab.Screen
+        component={HistoryScreen}
+        name="History"
+        options={{
+          tabBarLabel: tabLabels.History,
         }}
       />
       <Tab.Screen
@@ -208,20 +224,23 @@ const styles = StyleSheet.create({
     borderTopColor: 'rgba(118, 118, 131, 0.18)',
     borderTopWidth: StyleSheet.hairlineWidth,
     elevation: 0,
-    height: 84,
-    paddingBottom: 10,
-    paddingTop: 8,
+    height: 82,
+    paddingBottom: 8,
+    paddingHorizontal: 2,
+    paddingTop: 6,
   },
   tabItem: {
-    borderRadius: 14,
-    marginHorizontal: 4,
-    marginTop: 2,
+    borderRadius: 12,
+    marginHorizontal: 0,
+    marginTop: 0,
+    minWidth: 0,
+    paddingHorizontal: 0,
   },
   tabLabel: {
     fontFamily: fontFamily.headlineBold,
-    fontSize: 11,
-    letterSpacing: 1,
-    marginTop: 2,
+    fontSize: 10,
+    letterSpacing: 0.4,
+    marginTop: 1,
     textTransform: 'uppercase',
   },
 });

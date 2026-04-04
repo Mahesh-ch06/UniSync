@@ -7,6 +7,7 @@
 	- `SUPABASE_URL`
 	- `SUPABASE_SERVICE_ROLE_KEY`
 	- `CLERK_SECRET_KEY`
+	- `GEMINI_API_KEY` (Google AI Studio key for vision classification, free tier)
 3. Run Supabase SQL migrations in order from [supabase/sql/README.md](supabase/sql/README.md).
 4. Start Expo: `npm run start:lan`
 5. Start backend locally: `npm run backend:dev`
@@ -15,6 +16,7 @@
 
 - Campus points and level progression (`/api/points/me`)
 - Lost board feed (`/api/lost-items`)
+- Found item posting (`/api/found-items`)
 - Camera/gallery scan with item-type detection (`/api/vision/classify-item`)
 - Auto match claim submission with proof image (`/api/match-requests/auto`)
 - Incoming claim inbox for finders (`/api/match-requests/inbox`)
