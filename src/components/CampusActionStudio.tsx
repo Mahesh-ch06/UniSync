@@ -205,6 +205,13 @@ function formatStatusLabel(status: string): string {
 }
 
 function resolveStatusTone(status: string): { bg: string; fg: string } {
+  if (status === 'submitted') {
+    return {
+      bg: '#FFF4E5',
+      fg: '#8A5318',
+    };
+  }
+
   if (status === 'approved') {
     return {
       bg: '#E8F7ED',
@@ -456,11 +463,11 @@ export function CampusActionStudio({
   const filteredHistory = useMemo(() => {
     const filtered = claimHistory.filter((entry) => {
       if (historyFilter === 'active') {
-        return entry.status === 'approved';
+        return entry.status === 'submitted' || entry.status === 'approved';
       }
 
       if (historyFilter === 'completed') {
-        return entry.status !== 'approved';
+        return entry.status !== 'submitted' && entry.status !== 'approved';
       }
 
       return true;
@@ -470,8 +477,12 @@ export function CampusActionStudio({
   }, [claimHistory, compact, historyFilter]);
 
   const historyOverview = useMemo(() => {
-    const active = claimHistory.filter((entry) => entry.status === 'approved').length;
-    const completed = claimHistory.filter((entry) => entry.status !== 'approved').length;
+    const active = claimHistory.filter(
+      (entry) => entry.status === 'submitted' || entry.status === 'approved',
+    ).length;
+    const completed = claimHistory.filter(
+      (entry) => entry.status !== 'submitted' && entry.status !== 'approved',
+    ).length;
 
     return {
       all: claimHistory.length,

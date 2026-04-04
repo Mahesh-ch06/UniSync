@@ -19,3 +19,5 @@ Run files in numeric order:
 15. 015_verify_match_request_pickup_history.sql (optional)
 16. 016_match_request_messages.sql
 17. 017_verify_match_request_messages.sql (optional)
+18. 018_found_items_claim_visibility.sql
+19. 019_verify_found_items_claim_visibility.sql (optional)

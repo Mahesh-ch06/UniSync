@@ -1,6 +1,6 @@
 {
   "name": "mobileapp",
-  "version": "1.0.0",
+  "version": "1.0.6",
   "main": "index.ts",
   "scripts": {
     "start": "expo start",
@@ -9,6 +9,8 @@
     "android": "expo start --android",
     "ios": "expo start --ios",
     "web": "expo start --web",
+    "build:apk": "eas build -p android --profile apk",
+    "build:aab": "eas build -p android --profile production",
     "backend:start": "npm --prefix backend run start",
     "backend:dev": "npm --prefix backend run dev"
   },

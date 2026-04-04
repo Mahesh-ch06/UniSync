@@ -555,26 +555,18 @@ async function loadMatchRequestWithParticipants(requestId) {
   };
 }
 
-async function resolveUserIdFromAuthHeader(authHeader) {
-  const bearer = readText(authHeader || '');
-  const token = bearer.startsWith('Bearer ') ? bearer.slice(7).trim() : '';
-
-  if (!token || !clerkSecretKey) {
-    return '';
-  }
-
-  try {
-    const payload = await verifyToken(token, { secretKey: clerkSecretKey });
-    return readText(payload.sub);
-  } catch {
-    return '';
-  }
-}
-
-async function buildLatestResolvedMap(foundItemIds) {
+async function buildLatestClaimMap(foundItemIds, statuses = ['submitted', 'approved', 'picked_up']) {
   const validIds = foundItemIds.filter((value) => Boolean(readText(value)));
 
   if (!validIds.length) {
+    return new Map();
+  }
+
+  const validStatuses = Array.isArray(statuses)
+    ? statuses.map((value) => readText(value)).filter(Boolean)
+    : [];
+
+  if (!validStatuses.length) {
     return new Map();
   }
 
@@ -582,7 +574,7 @@ async function buildLatestResolvedMap(foundItemIds) {
     .from('match_requests')
     .select('id, found_item_id, claimant_user_id, status, reviewed_at, created_at')
     .in('found_item_id', validIds)
-    .in('status', ['approved', 'picked_up'])
+    .in('status', validStatuses)
     .order('reviewed_at', { ascending: false, nullsFirst: false })
     .order('created_at', { ascending: false });
 
@@ -604,6 +596,42 @@ async function buildLatestResolvedMap(foundItemIds) {
   return latestByFoundItem;
 }
 
+async function loadPublicFoundItems(limit = 120) {
+  const safeLimit = Number.isFinite(Number(limit)) ? Math.max(1, Number(limit)) : 120;
+
+  const primaryResponse = await supabase
+    .from('found_items')
+    .select('*')
+    .eq('is_public_visible', true)
+    .order('created_at', { ascending: false })
+    .limit(safeLimit);
+
+  if (!primaryResponse.error) {
+    return primaryResponse.data ?? [];
+  }
+
+  const errorMessage = readText(primaryResponse.error?.message).toLowerCase();
+  if (!errorMessage.includes('is_public_visible')) {
+    throw primaryResponse.error;
+  }
+
+  // Backward-compatible fallback for databases that do not yet have 018 migration.
+  const fallbackResponse = await supabase
+    .from('found_items')
+    .select('*')
+    .order('created_at', { ascending: false })
+    .limit(safeLimit);
+
+  if (fallbackResponse.error) {
+    throw fallbackResponse.error;
+  }
+
+  const rows = fallbackResponse.data ?? [];
+  const activeClaimMap = await buildLatestClaimMap(rows.map((item) => item.id));
+
+  return rows.filter((item) => !activeClaimMap.has(item.id));
+}
+
 async function assertFoundItemClaimable(foundItemId) {
   const { data: foundItem, error: foundError } = await supabase
     .from('found_items')
@@ -619,7 +647,7 @@ async function assertFoundItemClaimable(foundItemId) {
     throw new Error('Found item not found.');
   }
 
-  const latestMap = await buildLatestResolvedMap([foundItemId]);
+  const latestMap = await buildLatestClaimMap([foundItemId]);
   if (latestMap.has(foundItemId)) {
     throw new Error('This item has already been claimed and is not public anymore.');
   }
@@ -665,37 +693,7 @@ app.get('/health', (_req, res) => {
 
 app.get('/api/found-items', async (req, res) => {
   try {
-    const requesterUserId = await resolveUserIdFromAuthHeader(req.headers.authorization || '');
-
-    const { data, error } = await supabase
-      .from('found_items')
-      .select('*')
-      .order('created_at', { ascending: false })
-      .limit(120);
-
-    if (error) {
-      throw error;
-    }
-
-    const rows = data ?? [];
-    const resolvedMap = await buildLatestResolvedMap(rows.map((item) => item.id));
-
-    const items = rows.filter((item) => {
-      const resolved = resolvedMap.get(item.id);
-
-      if (!resolved) {
-        return true;
-      }
-
-      if (!requesterUserId) {
-        return false;
-      }
-
-      const ownerId = readText(item.created_by);
-      const claimantId = readText(resolved.claimant_user_id);
-
-      return requesterUserId === ownerId || requesterUserId === claimantId;
-    });
+    const items = await loadPublicFoundItems(120);
 
     res.json({ items });
   } catch (error) {
@@ -1012,19 +1010,8 @@ app.post('/api/match-requests/auto', requireClerkAuth, async (req, res) => {
       });
     }
 
-    const { data: foundItems, error: foundError } = await supabase
-      .from('found_items')
-      .select('id, title, category, location, image_url, created_at, created_by')
-      .order('created_at', { ascending: false })
-      .limit(120);
-
-    if (foundError) {
-      throw foundError;
-    }
-
-    const rawFoundItems = foundItems ?? [];
-    const resolvedMap = await buildLatestResolvedMap(rawFoundItems.map((item) => item.id));
-    const claimableFoundItems = rawFoundItems.filter((item) => !resolvedMap.has(item.id));
+    const rawFoundItems = await loadPublicFoundItems(120);
+    const claimableFoundItems = rawFoundItems;
 
     if (!claimableFoundItems.length) {
       res.status(200).json({
@@ -1366,7 +1353,7 @@ app.get('/api/match-requests/history/me', requireClerkAuth, async (req, res) => 
         )
       `,
       )
-      .in('status', ['approved', 'rejected', 'picked_up', 'cancelled'])
+      .in('status', ['submitted', 'approved', 'rejected', 'picked_up', 'cancelled'])
       .order('created_at', { ascending: false })
       .limit(120);
 

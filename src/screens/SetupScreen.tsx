@@ -1,3 +1,4 @@
+import React from 'react';
 import { StyleSheet, Text, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
@@ -21,11 +22,9 @@ export function SetupScreen({ missingKeys }: SetupScreenProps) {
         </Text>
 
         <View style={styles.keysCard}>
-          {missingKeys.map((keyName) => (
-            <Text key={keyName} style={styles.keyLine}>
-              {keyName}
-            </Text>
-          ))}
+          {React.Children.toArray(
+            missingKeys.map((keyName) => <Text style={styles.keyLine}>{keyName}</Text>),
+          )}
         </View>
       </View>
     </SafeAreaView>

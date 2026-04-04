@@ -4,7 +4,7 @@ import { useUser } from '@clerk/clerk-expo';
 import { NavigationProp, useNavigation } from '@react-navigation/native';
 import * as SecureStore from 'expo-secure-store';
 import * as ImagePicker from 'expo-image-picker';
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Animated,
@@ -1009,27 +1009,29 @@ export function HomeScreen() {
               <Text style={styles.approvedClaimTitle}>You Can Claim Your Product</Text>
             </View>
 
-            {approvedClaimReminders.map((entry) => (
-              <View key={entry.requestId} style={styles.approvedClaimCard}>
-                <View style={styles.approvedClaimTopRow}>
-                  <Text numberOfLines={1} style={styles.approvedClaimItemTitle}>
-                    {entry.title}
+            {React.Children.toArray(
+              approvedClaimReminders.map((entry) => (
+                <View style={styles.approvedClaimCard}>
+                  <View style={styles.approvedClaimTopRow}>
+                    <Text numberOfLines={1} style={styles.approvedClaimItemTitle}>
+                      {entry.title}
+                    </Text>
+                    <Text style={styles.approvedClaimAgo}>{formatFoundAgo(entry.approvedAt)}</Text>
+                  </View>
+
+                  <Text numberOfLines={1} style={styles.approvedClaimLocation}>
+                    {entry.location}
                   </Text>
-                  <Text style={styles.approvedClaimAgo}>{formatFoundAgo(entry.approvedAt)}</Text>
+
+                  <Pressable
+                    onPress={() => openApprovedClaimReminder(entry)}
+                    style={styles.approvedClaimButton}
+                  >
+                    <Text style={styles.approvedClaimButtonText}>Claim Your Product</Text>
+                  </Pressable>
                 </View>
-
-                <Text numberOfLines={1} style={styles.approvedClaimLocation}>
-                  {entry.location}
-                </Text>
-
-                <Pressable
-                  onPress={() => openApprovedClaimReminder(entry)}
-                  style={styles.approvedClaimButton}
-                >
-                  <Text style={styles.approvedClaimButtonText}>Claim Your Product</Text>
-                </Pressable>
-              </View>
-            ))}
+              )),
+            )}
           </View>
         ) : null}
 
@@ -1347,16 +1349,15 @@ export function HomeScreen() {
             </Pressable>
           </View>
         ) : (
-          prioritizedVisibleItems
-            .slice(0, 40)
-            .map((item) => (
+          React.Children.toArray(
+            prioritizedVisibleItems.slice(0, 40).map((item) => (
               <FoundItemCard
                 highlighted={item.id === focusedItemId}
                 item={item}
-                key={item.id}
                 onClaimPress={(target) => openClaimForItem(target, 'manual')}
               />
-            ))
+            )),
+          )
         )}
 
         <View style={styles.toolsWrap}>
