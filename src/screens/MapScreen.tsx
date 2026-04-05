@@ -20,7 +20,7 @@ function Marker({ active = false }: { active?: boolean }) {
 export function MapScreen() {
   return (
     <SafeAreaView edges={['top']} style={styles.safeArea}>
-      <AppTopBar leftIcon="menu" title="CampusFind" />
+      <AppTopBar leftIcon="menu" title="UniSync" />
 
       <View style={styles.root}>
         <View style={styles.mapCanvas}>

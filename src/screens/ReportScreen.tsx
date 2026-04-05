@@ -26,7 +26,7 @@ export function ReportScreen() {
 
   return (
     <SafeAreaView edges={['top']} style={styles.safeArea}>
-      <AppTopBar leftIcon="menu" title="CampusFind" />
+      <AppTopBar leftIcon="menu" title="UniSync" />
 
       <ScrollView contentContainerStyle={styles.content} showsVerticalScrollIndicator={false}>
         <View style={styles.uploadZone}>

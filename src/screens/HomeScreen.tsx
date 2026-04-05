@@ -28,6 +28,7 @@ import { colors, fontFamily, radii, shadows } from '../theme/tokens';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const APPROVED_POPUP_STORAGE_PREFIX = 'approved-claim-popup-seen-v1';
+const REQUEST_TIMEOUT_MS = 15000;
 
 type CampusZone = 'Academic' | 'Residence' | 'Transit' | 'Commons' | 'General';
 type SortMode = 'latest' | 'priority';
@@ -272,6 +273,32 @@ function mapRowToItem(row: Record<string, unknown>): FoundItem {
     campusZone: inferCampusZone(location),
     recoveryScore: computeRecoveryScore(category, location, safeCreatedAtMs),
   };
+}
+
+async function fetchWithTimeout(
+  input: Parameters<typeof fetch>[0],
+  init?: Parameters<typeof fetch>[1],
+  timeoutMs: number = REQUEST_TIMEOUT_MS,
+): Promise<Response> {
+  const controller = new AbortController();
+  const timeoutHandle = setTimeout(() => {
+    controller.abort();
+  }, timeoutMs);
+
+  try {
+    return await fetch(input, {
+      ...(init ?? {}),
+      signal: controller.signal,
+    });
+  } catch (error) {
+    if (error instanceof Error && error.name === 'AbortError') {
+      throw new Error('Request timed out. Check your internet and try again.');
+    }
+
+    throw error;
+  } finally {
+    clearTimeout(timeoutHandle);
+  }
 }
 
 function tokenize(input: string): string[] {
@@ -635,7 +662,7 @@ export function HomeScreen() {
         const token = await getTokenRef.current().catch(() => null);
 
         const [response, historyResponse] = await Promise.all([
-          fetch(`${backendBaseUrl}/api/found-items`, {
+          fetchWithTimeout(`${backendBaseUrl}/api/found-items`, {
             headers: token
               ? {
                   Authorization: `Bearer ${token}`,
@@ -643,7 +670,7 @@ export function HomeScreen() {
               : undefined,
           }),
           token
-            ? fetch(`${backendBaseUrl}/api/match-requests/history/me`, {
+            ? fetchWithTimeout(`${backendBaseUrl}/api/match-requests/history/me`, {
                 headers: {
                   Authorization: `Bearer ${token}`,
                 },
@@ -842,7 +869,7 @@ export function HomeScreen() {
     }
 
     const result = await ImagePicker.launchImageLibraryAsync({
-      mediaTypes: ImagePicker.MediaTypeOptions.Images,
+      mediaTypes: ['images'],
       allowsEditing: true,
       quality: 0.72,
       base64: true,
@@ -862,7 +889,7 @@ export function HomeScreen() {
     setAiNotice('AI is checking your image...');
 
     try {
-      const response = await fetch(`${backendBaseUrl}/api/vision/classify-item`, {
+      const response = await fetchWithTimeout(`${backendBaseUrl}/api/vision/classify-item`, {
         method: 'POST',
         headers: {
           Authorization: `Bearer ${token}`,
@@ -971,7 +998,7 @@ export function HomeScreen() {
 
   return (
     <SafeAreaView edges={['top']} style={styles.safeArea}>
-      <AppTopBar leftIcon="menu" title="CampusFind" />
+      <AppTopBar leftIcon="menu" title="UniSync" />
 
       <ScrollView
         contentContainerStyle={styles.content}
@@ -1009,29 +1036,27 @@ export function HomeScreen() {
               <Text style={styles.approvedClaimTitle}>You Can Claim Your Product</Text>
             </View>
 
-            {React.Children.toArray(
-              approvedClaimReminders.map((entry) => (
-                <View style={styles.approvedClaimCard}>
-                  <View style={styles.approvedClaimTopRow}>
-                    <Text numberOfLines={1} style={styles.approvedClaimItemTitle}>
-                      {entry.title}
-                    </Text>
-                    <Text style={styles.approvedClaimAgo}>{formatFoundAgo(entry.approvedAt)}</Text>
-                  </View>
-
-                  <Text numberOfLines={1} style={styles.approvedClaimLocation}>
-                    {entry.location}
+            {approvedClaimReminders.map((entry) => (
+              <View key={`${entry.requestId}-${entry.foundItemId}`} style={styles.approvedClaimCard}>
+                <View style={styles.approvedClaimTopRow}>
+                  <Text numberOfLines={1} style={styles.approvedClaimItemTitle}>
+                    {entry.title}
                   </Text>
-
-                  <Pressable
-                    onPress={() => openApprovedClaimReminder(entry)}
-                    style={styles.approvedClaimButton}
-                  >
-                    <Text style={styles.approvedClaimButtonText}>Claim Your Product</Text>
-                  </Pressable>
+                  <Text style={styles.approvedClaimAgo}>{formatFoundAgo(entry.approvedAt)}</Text>
                 </View>
-              )),
-            )}
+
+                <Text numberOfLines={1} style={styles.approvedClaimLocation}>
+                  {entry.location}
+                </Text>
+
+                <Pressable
+                  onPress={() => openApprovedClaimReminder(entry)}
+                  style={styles.approvedClaimButton}
+                >
+                  <Text style={styles.approvedClaimButtonText}>Claim Your Product</Text>
+                </Pressable>
+              </View>
+            ))}
           </View>
         ) : null}
 
@@ -1349,15 +1374,14 @@ export function HomeScreen() {
             </Pressable>
           </View>
         ) : (
-          React.Children.toArray(
-            prioritizedVisibleItems.slice(0, 40).map((item) => (
-              <FoundItemCard
-                highlighted={item.id === focusedItemId}
-                item={item}
-                onClaimPress={(target) => openClaimForItem(target, 'manual')}
-              />
-            )),
-          )
+          prioritizedVisibleItems.slice(0, 40).map((item) => (
+            <FoundItemCard
+              key={item.id}
+              highlighted={item.id === focusedItemId}
+              item={item}
+              onClaimPress={(target) => openClaimForItem(target, 'manual')}
+            />
+          ))
         )}
 
         <View style={styles.toolsWrap}>

@@ -2,7 +2,8 @@ import { MaterialIcons } from '@expo/vector-icons';
 import { useAuth } from '@clerk/clerk-expo';
 import { useUser } from '@clerk/clerk-expo';
 import * as ImagePicker from 'expo-image-picker';
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import * as Location from 'expo-location';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Image,
@@ -19,6 +20,17 @@ import { backendEnv } from '../config/env';
 import { colors, fontFamily, radii, shadows } from '../theme/tokens';
 
 type StudioMode = 'lost' | 'claim' | 'found';
+type AiAssistPhase = 'analyzing' | 'review';
+
+type AiAssistDraft = {
+  suggestedTitle: string;
+  suggestedDescription: string;
+  suggestedLocation: string;
+  detectedLabel: string;
+  detectedCategory: string;
+  confidencePercent: number;
+  tags: string[];
+};
 
 type PickedImage = {
   uri: string;
@@ -132,6 +144,14 @@ const LEVEL_STEPS = [
   { level: 'Guardian', min: 350, max: 699, next: 'Champion', nextTarget: 700 },
   { level: 'Champion', min: 700, max: 1199, next: 'Legend', nextTarget: 1200 },
   { level: 'Legend', min: 1200, max: Number.MAX_SAFE_INTEGER, next: null, nextTarget: null },
+] as const;
+
+const AI_ANALYSIS_STEPS = [
+  'Reading image details',
+  'Detecting item category',
+  'Drafting title and description',
+  'Checking confidence level',
+  'Preparing autofill suggestion',
 ] as const;
 
 function safeString(value: unknown): string {
@@ -271,6 +291,42 @@ function normalizeScanDetection(value: unknown): ScanDetection {
     category: safeString(record.category) || 'General',
     confidence: Math.max(0, Math.min(1, safeNumber(record.confidence) || 0.35)),
     tags: tagsValue.length ? tagsValue : ['campus'],
+  };
+}
+
+function createAiAssistDraft(
+  mode: StudioMode,
+  detection: ScanDetection,
+  suggestedLocation: string,
+): AiAssistDraft {
+  const rawLabel = safeString(detection.label) || 'Item';
+  const normalizedLabel = rawLabel
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/^\w/, (value) => value.toUpperCase());
+
+  const confidencePercent = Math.round(
+    Math.max(0, Math.min(1, safeNumber(detection.confidence) || 0)) * 100,
+  );
+
+  const normalizedTags = detection.tags.filter((tag) => Boolean(safeString(tag))).slice(0, 4);
+  const tagsText = normalizedTags.length ? normalizedTags.join(', ') : 'No extra tags';
+
+  const suggestedTitle = mode === 'lost' ? `Lost ${normalizedLabel}` : `Found ${normalizedLabel}`;
+
+  const suggestedDescription =
+    mode === 'lost'
+      ? `I lost this item near campus. AI detected "${normalizedLabel}" in category "${detection.category}" with ${confidencePercent}% confidence. Distinguishing signs: ${tagsText}.`
+      : `Found this item near ${suggestedLocation || 'campus area'}. AI detected "${normalizedLabel}" in category "${detection.category}" with ${confidencePercent}% confidence. Distinguishing signs: ${tagsText}.`;
+
+  return {
+    suggestedTitle,
+    suggestedDescription,
+    suggestedLocation,
+    detectedLabel: normalizedLabel,
+    detectedCategory: detection.category,
+    confidencePercent,
+    tags: normalizedTags,
   };
 }
 
@@ -420,6 +476,11 @@ export function CampusActionStudio({
   const [description, setDescription] = useState('');
   const [locationHint, setLocationHint] = useState('');
   const [selectedClaimItemId, setSelectedClaimItemId] = useState('');
+  const [isResolvingLocation, setIsResolvingLocation] = useState(false);
+  const [isAiAssistModalVisible, setIsAiAssistModalVisible] = useState(false);
+  const [aiAssistPhase, setAiAssistPhase] = useState<AiAssistPhase>('analyzing');
+  const [aiAssistStepIndex, setAiAssistStepIndex] = useState(0);
+  const [aiAssistDraft, setAiAssistDraft] = useState<AiAssistDraft | null>(null);
 
   const [isWorking, setIsWorking] = useState(false);
   const [actionError, setActionError] = useState('');
@@ -752,6 +813,11 @@ export function CampusActionStudio({
     setDescription('');
     setLocationHint('');
     setSelectedClaimItemId('');
+    setIsResolvingLocation(false);
+    setIsAiAssistModalVisible(false);
+    setAiAssistPhase('analyzing');
+    setAiAssistStepIndex(0);
+    setAiAssistDraft(null);
     setActionError('');
     setActionNotice('');
   }, []);
@@ -826,7 +892,7 @@ export function CampusActionStudio({
     }
 
     const result = await ImagePicker.launchImageLibraryAsync({
-      mediaTypes: ImagePicker.MediaTypeOptions.Images,
+      mediaTypes: ['images'],
       allowsEditing: true,
       quality: 0.72,
       base64: true,
@@ -866,6 +932,81 @@ export function CampusActionStudio({
       applyPickedAsset(asset);
     }
   }, [applyPickedAsset]);
+
+  const resolveCurrentLocation = useCallback(
+    async (options?: { silentSuccess?: boolean }): Promise<string> => {
+      setIsResolvingLocation(true);
+      setActionError('');
+
+      try {
+        const permission = await Location.requestForegroundPermissionsAsync();
+
+        if (permission.status !== 'granted') {
+          setActionError('Location permission is required to auto-fill found location.');
+          return '';
+        }
+
+        const position = await Location.getCurrentPositionAsync({
+          accuracy: Location.Accuracy.Balanced,
+        });
+
+        const geocoded = await Location.reverseGeocodeAsync({
+          latitude: position.coords.latitude,
+          longitude: position.coords.longitude,
+        });
+
+        const first = geocoded[0] as Record<string, unknown> | undefined;
+        const parts = [
+          safeString(first?.name),
+          safeString(first?.street),
+          safeString(first?.district),
+          safeString(first?.city),
+          safeString(first?.region),
+        ].filter(Boolean);
+
+        const fallback = `Lat ${position.coords.latitude.toFixed(5)}, Lon ${position.coords.longitude.toFixed(5)}`;
+        const nextLocation = parts.length ? parts.slice(0, 4).join(', ') : fallback;
+
+        setLocationHint(nextLocation);
+
+        if (!options?.silentSuccess) {
+          setActionNotice('Live location added for found item.');
+        }
+
+        return nextLocation;
+      } catch {
+        setActionError('Could not fetch live location. Check GPS and try again.');
+        return '';
+      } finally {
+        setIsResolvingLocation(false);
+      }
+    },
+    [],
+  );
+
+  const closeAiAssistModal = useCallback(() => {
+    setIsAiAssistModalVisible(false);
+    setAiAssistPhase('analyzing');
+    setAiAssistStepIndex(0);
+    setAiAssistDraft(null);
+  }, []);
+
+  const applyAiAssistDraft = useCallback(() => {
+    if (!aiAssistDraft) {
+      closeAiAssistModal();
+      return;
+    }
+
+    setTitle(aiAssistDraft.suggestedTitle);
+    setDescription(aiAssistDraft.suggestedDescription);
+
+    if (mode === 'found' && aiAssistDraft.suggestedLocation) {
+      setLocationHint(aiAssistDraft.suggestedLocation);
+    }
+
+    setActionNotice('AI suggestions inserted. Review once and submit.');
+    closeAiAssistModal();
+  }, [aiAssistDraft, closeAiAssistModal, mode]);
 
   const runScan = useCallback(async (): Promise<ScanResult | null> => {
     if (!backendBaseUrl) {
@@ -920,9 +1061,57 @@ export function CampusActionStudio({
     }
   }, [authedJsonRequest, backendBaseUrl, description, locationHint, pickedImage, title]);
 
+  const triggerAiAssist = useCallback(async () => {
+    if (!pickedImage) {
+      setActionError('Upload an image first to use AI autofill.');
+      return;
+    }
+
+    setActionError('');
+    setIsAiAssistModalVisible(true);
+    setAiAssistPhase('analyzing');
+    setAiAssistStepIndex(0);
+    setAiAssistDraft(null);
+
+    const maxStepIndex = AI_ANALYSIS_STEPS.length - 1;
+
+    const stepTimer = setInterval(() => {
+      setAiAssistStepIndex((previous) => (previous < maxStepIndex ? previous + 1 : previous));
+    }, 520);
+
+    try {
+      const ensuredScan = scanResult ?? (await runScan());
+
+      if (!ensuredScan) {
+        closeAiAssistModal();
+        return;
+      }
+
+      const liveLocation =
+        mode === 'found' ? await resolveCurrentLocation({ silentSuccess: true }) : '';
+
+      const nextDraft = createAiAssistDraft(
+        mode,
+        ensuredScan.detection,
+        liveLocation || locationHint.trim(),
+      );
+
+      setAiAssistDraft(nextDraft);
+      setAiAssistStepIndex(maxStepIndex);
+      setAiAssistPhase('review');
+    } finally {
+      clearInterval(stepTimer);
+    }
+  }, [closeAiAssistModal, locationHint, mode, pickedImage, resolveCurrentLocation, runScan, scanResult]);
+
   const submitLostReport = useCallback(async () => {
     if (!pickedImage) {
       setActionError('Please upload an image first.');
+      return;
+    }
+
+    if (!locationHint.trim()) {
+      setActionError('Enter where it got lost before submitting.');
       return;
     }
 
@@ -994,6 +1183,11 @@ export function CampusActionStudio({
   const submitFoundItem = useCallback(async () => {
     if (!pickedImage) {
       setActionError('Please upload an image first.');
+      return;
+    }
+
+    if (!locationHint.trim()) {
+      setActionError('Use live location icon or enter found location before submitting.');
       return;
     }
 
@@ -2057,9 +2251,9 @@ export function CampusActionStudio({
             <View style={styles.modalHeader}>
               <Text style={styles.modalTitle}>
                 {mode === 'lost'
-                  ? 'Report Lost Product'
+                  ? 'Report Lost Item'
                   : mode === 'found'
-                    ? 'Add Found Product'
+                    ? 'Add Found Item'
                     : 'Start New Claim'}
               </Text>
               <Pressable onPress={closeComposer}>
@@ -2067,9 +2261,24 @@ export function CampusActionStudio({
               </Pressable>
             </View>
 
-            <ScrollView showsVerticalScrollIndicator={false}>
+            <Text style={styles.modalSubtitle}>
+              {mode === 'claim'
+                ? 'Select the found item and attach proof so owner verification is fast and secure.'
+                : mode === 'found'
+                  ? 'Capture key details and location so the owner can identify this item quickly.'
+                  : 'Share clear details, proof notes, and where you lost it to get better matches.'}
+            </Text>
+
+            {mode === 'claim' ? (
+              <View style={styles.claimModeBadgeRow}>
+                <MaterialIcons color={colors.primary} name="verified-user" size={14} />
+                <Text style={styles.claimModeBadgeText}>Claim Proof Mode</Text>
+              </View>
+            ) : null}
+
+            <ScrollView contentContainerStyle={styles.modalScrollContent} showsVerticalScrollIndicator={false}>
               {mode === 'claim' ? (
-                <>
+                <View style={styles.claimSelectionCard}>
                   <View style={styles.claimFlowHintCard}>
                     <MaterialIcons color={colors.primary} name="info-outline" size={15} />
                     <Text style={styles.claimFlowHintText}>
@@ -2133,94 +2342,169 @@ export function CampusActionStudio({
                       Selected item: {selectedClaimItem.title} • {selectedClaimItem.location}
                     </Text>
                   ) : null}
-                </>
+                </View>
               ) : null}
 
-              <View style={styles.imagePickerWrap}>
-                {pickedImage ? (
-                  <Image source={{ uri: pickedImage.uri }} style={styles.previewImage} />
-                ) : (
-                  <View style={styles.previewPlaceholder}>
-                    <MaterialIcons color={colors.outline} name="add-a-photo" size={28} />
-                    <Text style={styles.previewPlaceholderText}>Capture or upload image</Text>
+              <View style={[styles.mediaSectionCard, mode === 'claim' ? styles.claimModeCard : undefined]}>
+                <View style={styles.imagePickerWrap}>
+                  {pickedImage ? (
+                    <Image source={{ uri: pickedImage.uri }} style={styles.previewImage} />
+                  ) : (
+                    <View style={styles.previewPlaceholder}>
+                      <MaterialIcons color={colors.outline} name="add-a-photo" size={28} />
+                      <Text style={styles.previewPlaceholderText}>Capture or upload image</Text>
+                    </View>
+                  )}
+                </View>
+
+                <View style={styles.modalActionRow}>
+                  <Pressable onPress={() => void pickFromCamera()} style={styles.modalActionChip}>
+                    <MaterialIcons color={colors.primary} name="photo-camera" size={15} />
+                    <Text style={styles.modalActionChipText}>Camera</Text>
+                  </Pressable>
+
+                  <Pressable onPress={() => void pickFromGallery()} style={styles.modalActionChip}>
+                    <MaterialIcons color={colors.primary} name="photo-library" size={15} />
+                    <Text style={styles.modalActionChipText}>Gallery</Text>
+                  </Pressable>
+
+                  <Pressable onPress={() => void runScan()} style={styles.modalActionChipPrimary}>
+                    <MaterialIcons color={colors.onPrimary} name="psychology" size={15} />
+                    <Text style={styles.modalActionChipPrimaryText}>Scan Image</Text>
+                  </Pressable>
+
+                  <Pressable
+                    disabled={Boolean(isWorking) || !pickedImage}
+                    onPress={() => void triggerAiAssist()}
+                    style={[
+                      styles.modalActionIconButton,
+                      Boolean(isWorking) || !pickedImage ? styles.modalActionIconButtonDisabled : undefined,
+                    ]}
+                  >
+                    <MaterialIcons color={colors.primary} name="auto-awesome" size={15} />
+                    <Text style={styles.modalActionIconButtonText}>AI Assist</Text>
+                  </Pressable>
+                </View>
+
+                {scanResult ? (
+                  <View style={styles.scanCard}>
+                    <Text style={styles.scanTitle}>Detected: {scanResult.detection.label}</Text>
+                    <Text style={styles.scanMeta}>
+                      Category: {scanResult.detection.category} • Confidence {Math.round(scanResult.detection.confidence * 100)}%
+                    </Text>
+                    <Text style={styles.scanTags}>Tags: {scanResult.detection.tags.join(', ')}</Text>
                   </View>
-                )}
+                ) : null}
               </View>
 
-              <View style={styles.modalActionRow}>
-                <Pressable onPress={() => void pickFromCamera()} style={styles.modalActionChip}>
-                  <MaterialIcons color={colors.primary} name="photo-camera" size={15} />
-                  <Text style={styles.modalActionChipText}>Camera</Text>
-                </Pressable>
+              <View style={[styles.detailsSectionCard, mode === 'claim' ? styles.claimModeCard : undefined]}>
+                {mode === 'claim' ? (
+                  <View style={styles.claimChecklistCard}>
+                    <View style={styles.claimChecklistRow}>
+                      <MaterialIcons color={colors.primary} name="check-circle" size={14} />
+                      <Text style={styles.claimChecklistText}>Upload clear item proof photo</Text>
+                    </View>
+                    <View style={styles.claimChecklistRow}>
+                      <MaterialIcons color={colors.primary} name="check-circle" size={14} />
+                      <Text style={styles.claimChecklistText}>Mention unique ownership details</Text>
+                    </View>
+                    <View style={styles.claimChecklistRow}>
+                      <MaterialIcons color={colors.primary} name="check-circle" size={14} />
+                      <Text style={styles.claimChecklistText}>Add last seen location for better matching</Text>
+                    </View>
+                  </View>
+                ) : null}
 
-                <Pressable onPress={() => void pickFromGallery()} style={styles.modalActionChip}>
-                  <MaterialIcons color={colors.primary} name="photo-library" size={15} />
-                  <Text style={styles.modalActionChipText}>Gallery</Text>
-                </Pressable>
+                <Text style={styles.inputLabel}>
+                  {mode === 'claim' ? 'Your Item Name (Optional)' : 'Item Title'}
+                </Text>
+                <TextInput
+                  onChangeText={setTitle}
+                  placeholder={
+                    mode === 'claim'
+                      ? 'e.g., Black Lenovo Laptop with sticker'
+                      : 'e.g., Black Lenovo Laptop'
+                  }
+                  placeholderTextColor={colors.outline}
+                  style={styles.input}
+                  value={title}
+                />
 
-                <Pressable onPress={() => void runScan()} style={styles.modalActionChipPrimary}>
-                  <MaterialIcons color={colors.onPrimary} name="psychology" size={15} />
-                  <Text style={styles.modalActionChipPrimaryText}>Scan Type</Text>
-                </Pressable>
+                <Text style={styles.inputLabel}>
+                  {mode === 'claim' ? 'Ownership Proof Details (Required)' : 'Description / Proof Notes'}
+                </Text>
+                <TextInput
+                  multiline
+                  onChangeText={setDescription}
+                  placeholder={
+                    mode === 'lost'
+                      ? 'Add unique details so owner can identify...'
+                      : mode === 'found'
+                        ? 'Add details that help owner verify this item...'
+                        : 'Add ownership proof details...'
+                  }
+                  placeholderTextColor={colors.outline}
+                  style={styles.inputMultiline}
+                  value={description}
+                />
+
+                <Text style={styles.inputLabel}>
+                  {mode === 'found'
+                    ? 'Found Location (Required)'
+                    : mode === 'lost'
+                      ? 'Lost At Location (Required)'
+                      : 'Last Seen Location'}
+                </Text>
+
+                <View style={styles.locationInputRow}>
+                  <TextInput
+                    onChangeText={setLocationHint}
+                    placeholder={
+                      mode === 'lost'
+                        ? 'Required: where item got lost'
+                        : mode === 'found'
+                          ? 'Required: live or manual found location'
+                          : 'e.g., Main Library near Block B'
+                    }
+                    placeholderTextColor={colors.outline}
+                    style={styles.locationInputField}
+                    value={locationHint}
+                  />
+
+                  {mode === 'found' ? (
+                    <Pressable
+                      disabled={Boolean(isWorking) || isResolvingLocation}
+                      onPress={() => void resolveCurrentLocation()}
+                      style={[
+                        styles.locationPinButton,
+                        Boolean(isWorking) || isResolvingLocation
+                          ? styles.locationPinButtonDisabled
+                          : undefined,
+                      ]}
+                    >
+                      {isResolvingLocation ? (
+                        <ActivityIndicator color={colors.primary} size="small" />
+                      ) : (
+                        <MaterialIcons color={colors.primary} name="my-location" size={17} />
+                      )}
+                    </Pressable>
+                  ) : null}
+                </View>
+
+                {actionError ? (
+                  <View style={styles.errorWrap}>
+                    <MaterialIcons color={colors.error} name="error-outline" size={15} />
+                    <Text style={styles.errorText}>{actionError}</Text>
+                  </View>
+                ) : null}
+
+                {actionNotice ? (
+                  <View style={styles.noticeWrap}>
+                    <MaterialIcons color={colors.success} name="check-circle" size={15} />
+                    <Text style={styles.noticeText}>{actionNotice}</Text>
+                  </View>
+                ) : null}
               </View>
-
-              {scanResult ? (
-                <View style={styles.scanCard}>
-                  <Text style={styles.scanTitle}>Detected: {scanResult.detection.label}</Text>
-                  <Text style={styles.scanMeta}>
-                    Category: {scanResult.detection.category} • Confidence {Math.round(scanResult.detection.confidence * 100)}%
-                  </Text>
-                  <Text style={styles.scanTags}>Tags: {scanResult.detection.tags.join(', ')}</Text>
-                </View>
-              ) : null}
-
-              <Text style={styles.inputLabel}>Item Title</Text>
-              <TextInput
-                onChangeText={setTitle}
-                placeholder="e.g., Black Lenovo Laptop"
-                placeholderTextColor={colors.outline}
-                style={styles.input}
-                value={title}
-              />
-
-              <Text style={styles.inputLabel}>Description / Proof Notes</Text>
-              <TextInput
-                multiline
-                onChangeText={setDescription}
-                placeholder={
-                  mode === 'lost'
-                    ? 'Add unique details so owner can identify...'
-                    : mode === 'found'
-                      ? 'Add details that help owner verify this item...'
-                      : 'Add ownership proof details...'
-                }
-                placeholderTextColor={colors.outline}
-                style={styles.inputMultiline}
-                value={description}
-              />
-
-              <Text style={styles.inputLabel}>{mode === 'found' ? 'Found Location' : 'Location Hint'}</Text>
-              <TextInput
-                onChangeText={setLocationHint}
-                placeholder="e.g., Main Library, Block B"
-                placeholderTextColor={colors.outline}
-                style={styles.input}
-                value={locationHint}
-              />
-
-              {actionError ? (
-                <View style={styles.errorWrap}>
-                  <MaterialIcons color={colors.error} name="error-outline" size={15} />
-                  <Text style={styles.errorText}>{actionError}</Text>
-                </View>
-              ) : null}
-
-              {actionNotice ? (
-                <View style={styles.noticeWrap}>
-                  <MaterialIcons color={colors.success} name="check-circle" size={15} />
-                  <Text style={styles.noticeText}>{actionNotice}</Text>
-                </View>
-              ) : null}
 
               <Pressable
                 disabled={isWorking || isClaimSubmitBlocked}
@@ -2244,7 +2528,7 @@ export function CampusActionStudio({
                   <>
                     <MaterialIcons
                       color={colors.onPrimary}
-                      name={mode === 'claim' ? 'verified-user' : 'upload'}
+                      name={mode === 'claim' ? 'verified-user' : mode === 'found' ? 'inventory-2' : 'upload'}
                       size={17}
                     />
                     <Text style={styles.submitButtonText}>
@@ -2252,12 +2536,93 @@ export function CampusActionStudio({
                         ? 'Submit Lost Product'
                         : mode === 'found'
                           ? 'Submit Found Product'
-                          : 'Send Claim Proof'}
+                          : 'Submit Claim Request'}
                     </Text>
                   </>
                 )}
               </Pressable>
             </ScrollView>
+          </View>
+        </View>
+      </Modal>
+
+      <Modal animationType="fade" transparent visible={isAiAssistModalVisible}>
+        <View style={styles.modalBackdropCenter}>
+          <View style={styles.aiAssistCard}>
+            <View style={styles.aiAssistHeaderRow}>
+              <MaterialIcons color={colors.primary} name="auto-awesome" size={18} />
+              <Text style={styles.aiAssistTitle}>AI Autofill Assistant</Text>
+            </View>
+
+            {aiAssistPhase === 'analyzing' ? (
+              <>
+                <Text style={styles.aiAssistSubtitle}>Analyzing your image and preparing a draft...</Text>
+
+                {AI_ANALYSIS_STEPS.map((step, index) => {
+                  const isDone = index < aiAssistStepIndex;
+                  const isCurrent = index === aiAssistStepIndex;
+
+                  return (
+                    <View key={`${step}-${index}`} style={styles.aiAssistStepRow}>
+                      {isDone ? (
+                        <MaterialIcons color={colors.success} name="check-circle" size={16} />
+                      ) : isCurrent ? (
+                        <ActivityIndicator color={colors.primary} size="small" />
+                      ) : (
+                        <MaterialIcons color={colors.outline} name="radio-button-unchecked" size={16} />
+                      )}
+                      <Text
+                        style={[
+                          styles.aiAssistStepText,
+                          isDone ? styles.aiAssistStepTextDone : undefined,
+                        ]}
+                      >
+                        {step}
+                      </Text>
+                    </View>
+                  );
+                })}
+
+                <Pressable onPress={closeAiAssistModal} style={styles.aiAssistSecondaryButtonSingle}>
+                  <Text style={styles.aiAssistSecondaryButtonText}>Cancel</Text>
+                </Pressable>
+              </>
+            ) : aiAssistDraft ? (
+              <>
+                <Text style={styles.aiAssistSubtitle}>AI results ready. Insert or keep your manual values.</Text>
+
+                <View style={styles.aiDraftCard}>
+                  <Text style={styles.aiDraftLabel}>Title</Text>
+                  <Text style={styles.aiDraftValue}>{aiAssistDraft.suggestedTitle}</Text>
+
+                  <Text style={styles.aiDraftLabel}>Description</Text>
+                  <Text style={styles.aiDraftValue}>{aiAssistDraft.suggestedDescription}</Text>
+
+                  {mode === 'found' ? (
+                    <>
+                      <Text style={styles.aiDraftLabel}>Location</Text>
+                      <Text style={styles.aiDraftValue}>
+                        {aiAssistDraft.suggestedLocation || 'Permission needed to auto-fill live location.'}
+                      </Text>
+                    </>
+                  ) : null}
+
+                  <Text style={styles.aiDraftMeta}>
+                    {aiAssistDraft.detectedCategory} • {aiAssistDraft.confidencePercent}% confidence
+                  </Text>
+                </View>
+
+                <View style={styles.aiAssistActionsRow}>
+                  <Pressable onPress={closeAiAssistModal} style={styles.aiAssistSecondaryButton}>
+                    <Text style={styles.aiAssistSecondaryButtonText}>Keep Manual</Text>
+                  </Pressable>
+
+                  <Pressable onPress={applyAiAssistDraft} style={styles.aiAssistPrimaryButton}>
+                    <Text style={styles.aiAssistPrimaryButtonText}>Insert Details</Text>
+                  </Pressable>
+                </View>
+              </>
+            ) : null}
           </View>
         </View>
       </Modal>
@@ -2975,23 +3340,101 @@ const styles = StyleSheet.create({
     textTransform: 'uppercase',
   },
   modalSheet: {
-    backgroundColor: colors.background,
-    borderTopLeftRadius: 20,
-    borderTopRightRadius: 20,
-    maxHeight: '92%',
+    backgroundColor: colors.surface,
+    borderTopLeftRadius: 28,
+    borderTopRightRadius: 28,
+    maxHeight: '94%',
     paddingHorizontal: 16,
-    paddingTop: 14,
+    paddingTop: 16,
   },
   modalHeader: {
     alignItems: 'center',
     flexDirection: 'row',
     justifyContent: 'space-between',
-    marginBottom: 10,
+    marginBottom: 6,
   },
   modalTitle: {
     color: colors.primary,
     fontFamily: fontFamily.headlineBold,
-    fontSize: 20,
+    fontSize: 24,
+  },
+  modalSubtitle: {
+    color: colors.onSurfaceVariant,
+    fontFamily: fontFamily.bodyMedium,
+    fontSize: 12,
+    lineHeight: 18,
+    marginBottom: 10,
+  },
+  modalScrollContent: {
+    paddingBottom: 20,
+  },
+  claimModeBadgeRow: {
+    alignItems: 'center',
+    alignSelf: 'flex-start',
+    backgroundColor: '#EAF1FF',
+    borderColor: '#C8D8FA',
+    borderRadius: radii.pill,
+    borderWidth: 1,
+    flexDirection: 'row',
+    marginBottom: 10,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+  },
+  claimModeBadgeText: {
+    color: colors.primary,
+    fontFamily: fontFamily.bodySemiBold,
+    fontSize: 11,
+    marginLeft: 4,
+    textTransform: 'uppercase',
+  },
+  claimSelectionCard: {
+    backgroundColor: '#F4F7FF',
+    borderColor: '#DCE5FB',
+    borderRadius: radii.lg,
+    borderWidth: 1,
+    marginBottom: 12,
+    padding: 10,
+  },
+  mediaSectionCard: {
+    backgroundColor: '#FBFCFF',
+    borderColor: '#DFE6F5',
+    borderRadius: radii.lg,
+    borderWidth: 1,
+    marginBottom: 12,
+    padding: 10,
+  },
+  detailsSectionCard: {
+    backgroundColor: '#FBFCFF',
+    borderColor: '#DFE6F5',
+    borderRadius: radii.lg,
+    borderWidth: 1,
+    marginBottom: 12,
+    padding: 10,
+  },
+  claimModeCard: {
+    backgroundColor: '#F9FBFF',
+    borderColor: '#C9D9F8',
+  },
+  claimChecklistCard: {
+    backgroundColor: '#EEF4FF',
+    borderColor: '#CBDCFA',
+    borderRadius: radii.md,
+    borderWidth: 1,
+    marginBottom: 4,
+    paddingHorizontal: 10,
+    paddingVertical: 9,
+  },
+  claimChecklistRow: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    marginBottom: 6,
+  },
+  claimChecklistText: {
+    color: colors.primary,
+    flex: 1,
+    fontFamily: fontFamily.bodySemiBold,
+    fontSize: 11,
+    marginLeft: 6,
   },
   messagesSheet: {
     backgroundColor: colors.background,
@@ -3163,11 +3606,12 @@ const styles = StyleSheet.create({
   },
   imagePickerWrap: {
     alignItems: 'center',
-    backgroundColor: colors.surfaceLow,
-    borderColor: colors.surfaceHigh,
+    backgroundColor: '#F2F5FC',
+    borderColor: '#C7D2EA',
+    borderStyle: 'dashed',
     borderRadius: radii.lg,
     borderWidth: 1,
-    height: 220,
+    height: 210,
     justifyContent: 'center',
     overflow: 'hidden',
   },
@@ -3186,14 +3630,21 @@ const styles = StyleSheet.create({
   },
   modalActionRow: {
     flexDirection: 'row',
-    marginTop: 10,
+    flexWrap: 'wrap',
+    justifyContent: 'space-between',
+    marginTop: 12,
   },
   modalActionChip: {
+    flexDirection: 'row',
     alignItems: 'center',
     backgroundColor: '#E3EDFB',
+    borderColor: '#C8D8FA',
     borderRadius: radii.pill,
-    flexDirection: 'row',
-    marginRight: 8,
+    borderWidth: 1,
+    flexBasis: '48.5%',
+    justifyContent: 'center',
+    marginBottom: 8,
+    minHeight: 40,
     paddingHorizontal: 12,
     paddingVertical: 8,
   },
@@ -3207,7 +3658,13 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     backgroundColor: colors.primary,
     borderRadius: radii.pill,
+    borderWidth: 1,
+    borderColor: colors.primary,
     flexDirection: 'row',
+    flexBasis: '48.5%',
+    justifyContent: 'center',
+    marginBottom: 8,
+    minHeight: 40,
     paddingHorizontal: 12,
     paddingVertical: 8,
   },
@@ -3215,6 +3672,29 @@ const styles = StyleSheet.create({
     color: colors.onPrimary,
     fontFamily: fontFamily.bodySemiBold,
     fontSize: 12,
+    marginLeft: 4,
+  },
+  modalActionIconButton: {
+    alignItems: 'center',
+    backgroundColor: '#FFF4E5',
+    borderColor: '#F3D2A4',
+    borderRadius: radii.pill,
+    borderWidth: 1,
+    flexBasis: '48.5%',
+    flexDirection: 'row',
+    justifyContent: 'center',
+    marginBottom: 8,
+    minHeight: 40,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+  },
+  modalActionIconButtonDisabled: {
+    opacity: 0.6,
+  },
+  modalActionIconButtonText: {
+    color: colors.primary,
+    fontFamily: fontFamily.bodySemiBold,
+    fontSize: 11,
     marginLeft: 4,
   },
   scanCard: {
@@ -3252,8 +3732,8 @@ const styles = StyleSheet.create({
     textTransform: 'uppercase',
   },
   input: {
-    backgroundColor: colors.surface,
-    borderColor: colors.surfaceHigh,
+    backgroundColor: '#FFFFFF',
+    borderColor: '#D5DCEB',
     borderRadius: radii.md,
     borderWidth: 1,
     color: colors.onSurface,
@@ -3263,8 +3743,8 @@ const styles = StyleSheet.create({
     paddingVertical: 10,
   },
   inputMultiline: {
-    backgroundColor: colors.surface,
-    borderColor: colors.surfaceHigh,
+    backgroundColor: '#FFFFFF',
+    borderColor: '#D5DCEB',
     borderRadius: radii.md,
     borderWidth: 1,
     color: colors.onSurface,
@@ -3274,6 +3754,144 @@ const styles = StyleSheet.create({
     paddingHorizontal: 12,
     paddingTop: 10,
     textAlignVertical: 'top',
+  },
+  locationInputRow: {
+    alignItems: 'center',
+    flexDirection: 'row',
+  },
+  locationInputField: {
+    backgroundColor: '#FFFFFF',
+    borderColor: '#D5DCEB',
+    borderRadius: radii.md,
+    borderWidth: 1,
+    color: colors.onSurface,
+    flex: 1,
+    fontFamily: fontFamily.bodyMedium,
+    fontSize: 14,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+  },
+  locationPinButton: {
+    alignItems: 'center',
+    backgroundColor: '#E8EEFF',
+    borderColor: '#C8D8FA',
+    borderRadius: radii.md,
+    borderWidth: 1,
+    height: 42,
+    justifyContent: 'center',
+    marginLeft: 8,
+    width: 42,
+  },
+  locationPinButtonDisabled: {
+    opacity: 0.65,
+  },
+  aiAssistCard: {
+    backgroundColor: colors.surface,
+    borderRadius: radii.lg,
+    padding: 14,
+    width: '100%',
+  },
+  aiAssistHeaderRow: {
+    alignItems: 'center',
+    flexDirection: 'row',
+  },
+  aiAssistTitle: {
+    color: colors.primary,
+    fontFamily: fontFamily.headlineSemiBold,
+    fontSize: 16,
+    marginLeft: 6,
+  },
+  aiAssistSubtitle: {
+    color: colors.onSurfaceVariant,
+    fontFamily: fontFamily.bodyMedium,
+    fontSize: 12,
+    lineHeight: 18,
+    marginBottom: 10,
+    marginTop: 8,
+  },
+  aiAssistStepRow: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    marginBottom: 8,
+  },
+  aiAssistStepText: {
+    color: colors.onSurfaceVariant,
+    fontFamily: fontFamily.bodyMedium,
+    fontSize: 12,
+    marginLeft: 8,
+  },
+  aiAssistStepTextDone: {
+    color: '#1C6E44',
+    fontFamily: fontFamily.bodySemiBold,
+  },
+  aiDraftCard: {
+    backgroundColor: '#F3F6FF',
+    borderColor: '#DCE5FB',
+    borderRadius: radii.md,
+    borderWidth: 1,
+    padding: 10,
+  },
+  aiDraftLabel: {
+    color: colors.onSurfaceVariant,
+    fontFamily: fontFamily.bodySemiBold,
+    fontSize: 10,
+    letterSpacing: 0.7,
+    marginTop: 8,
+    textTransform: 'uppercase',
+  },
+  aiDraftValue: {
+    color: colors.onSurface,
+    fontFamily: fontFamily.bodyMedium,
+    fontSize: 12,
+    lineHeight: 18,
+    marginTop: 2,
+  },
+  aiDraftMeta: {
+    color: colors.primary,
+    fontFamily: fontFamily.bodySemiBold,
+    fontSize: 11,
+    marginTop: 10,
+  },
+  aiAssistActionsRow: {
+    flexDirection: 'row',
+    marginTop: 12,
+  },
+  aiAssistSecondaryButtonSingle: {
+    alignItems: 'center',
+    backgroundColor: colors.surfaceLow,
+    borderRadius: radii.pill,
+    justifyContent: 'center',
+    marginTop: 10,
+    minHeight: 38,
+  },
+  aiAssistSecondaryButton: {
+    alignItems: 'center',
+    backgroundColor: colors.surfaceLow,
+    borderRadius: radii.pill,
+    flex: 1,
+    justifyContent: 'center',
+    marginRight: 8,
+    minHeight: 38,
+  },
+  aiAssistSecondaryButtonText: {
+    color: colors.onSurfaceVariant,
+    fontFamily: fontFamily.bodySemiBold,
+    fontSize: 12,
+    textTransform: 'uppercase',
+  },
+  aiAssistPrimaryButton: {
+    alignItems: 'center',
+    backgroundColor: colors.primary,
+    borderRadius: radii.pill,
+    flex: 1,
+    justifyContent: 'center',
+    minHeight: 38,
+  },
+  aiAssistPrimaryButtonText: {
+    color: colors.onPrimary,
+    fontFamily: fontFamily.bodySemiBold,
+    fontSize: 12,
+    textTransform: 'uppercase',
   },
   errorWrap: {
     alignItems: 'center',
@@ -3314,11 +3932,12 @@ const styles = StyleSheet.create({
   submitButton: {
     alignItems: 'center',
     backgroundColor: colors.primary,
-    borderRadius: radii.md,
+    borderRadius: radii.pill,
     flexDirection: 'row',
     justifyContent: 'center',
     marginBottom: 18,
-    marginTop: 14,
+    marginTop: 2,
+    minHeight: 54,
     paddingVertical: 13,
   },
   submitButtonDisabled: {

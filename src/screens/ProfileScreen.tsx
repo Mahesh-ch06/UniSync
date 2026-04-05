@@ -29,7 +29,7 @@ export function ProfileScreen() {
 
   return (
     <SafeAreaView edges={['top']} style={styles.safeArea}>
-      <AppTopBar leftIcon="arrow-back" title="CampusFind" />
+      <AppTopBar leftIcon="arrow-back" title="UniSync" />
 
       <ScrollView contentContainerStyle={styles.content} showsVerticalScrollIndicator={false}>
         <View style={styles.previewCard}>

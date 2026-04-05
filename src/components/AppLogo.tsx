@@ -14,7 +14,7 @@ type AppLogoProps = {
 export function AppLogo({
   size = 34,
   showWordmark = true,
-  wordmark = 'CampusFind',
+  wordmark = 'UniSync',
   textColor = '#070B2B',
 }: AppLogoProps) {
   const iconSize = Math.max(Math.floor(size * 0.5), 14);

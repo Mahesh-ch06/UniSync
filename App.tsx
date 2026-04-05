@@ -167,7 +167,7 @@ export default function App() {
     return (
       <View style={styles.loaderWrap}>
         <ActivityIndicator color={colors.primary} size="large" />
-        <Text style={styles.loaderText}>Building CampusFind UI...</Text>
+        <Text style={styles.loaderText}>Building UniSync UI...</Text>
       </View>
     );
   }
@@ -178,6 +178,7 @@ export default function App() {
 
   return (
     <ClerkProvider
+      clerkJSVersion="5"
       publishableKey={backendEnv.clerkPublishableKey}
       tokenCache={tokenCache}
     >
