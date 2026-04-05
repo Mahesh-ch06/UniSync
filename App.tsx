@@ -7,7 +7,8 @@ import {
   useUser,
 } from '@clerk/clerk-expo';
 import { tokenCache } from '@clerk/clerk-expo/token-cache';
-import { MaterialIcons } from '@expo/vector-icons';
+import MaterialIcons from '@expo/vector-icons/MaterialIcons';
+import type { BottomTabNavigationOptions } from '@react-navigation/bottom-tabs';
 import {
   Inter_400Regular,
   Inter_500Medium,
@@ -79,7 +80,9 @@ const navigationTheme = {
 function AppTabs() {
   return (
     <Tab.Navigator
-      screenOptions={({ route }) => ({
+      screenOptions={(
+        { route }: { route: { name: keyof RootTabsParamList } },
+      ): BottomTabNavigationOptions => ({
         headerShown: false,
         sceneStyle: { backgroundColor: colors.background },
         tabBarStyle: styles.tabBar,
@@ -87,7 +90,7 @@ function AppTabs() {
         tabBarLabelStyle: styles.tabLabel,
         tabBarActiveTintColor: colors.primaryContainer,
         tabBarInactiveTintColor: '#8C8F9B',
-        tabBarIcon: ({ color, focused }) => {
+        tabBarIcon: ({ color, focused }: { color: string; focused: boolean }) => {
           const iconName = tabIcons[route.name as keyof RootTabsParamList];
 
           return <MaterialIcons color={color} name={iconName} size={focused ? 23 : 21} />;

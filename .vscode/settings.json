@@ -1,16 +1,14 @@
 {
     "java.configuration.updateBuildConfiguration": "disabled",
     "java.autobuild.enabled": false,
-    "java.import.gradle.enabled": true,
+    "java.import.gradle.enabled": false,
     "java.import.maven.enabled": false,
     "java.import.gradle.wrapper.enabled": false,
     "java.import.gradle.version": "8.14.3",
     "java.import.gradle.home": "C:\\Users\\mahes\\.gradle\\wrapper\\dists\\gradle-8.14.3-bin\\cv11ve7ro1n3o1j4so8xd9n66\\gradle-8.14.3",
     "java.gradle.buildServer.enabled": "off",
-    "gradle.nestedProjects": [
-        "android"
-    ],
-    "gradle.autoDetect": "on",
+    "gradle.nestedProjects": [],
+    "gradle.autoDetect": "off",
     "java.jdt.ls.java.home": "C:\\Program Files\\Java\\jdk-21",
     "java.configuration.runtimes": [
         {
@@ -77,5 +75,6 @@
             "**/MobileApp-deploy-*/**"
         ]
     },
+    "typescript.tsserver.experimental.enableProjectDiagnostics": false,
     "java.compile.nullAnalysis.mode": "automatic"
 }
