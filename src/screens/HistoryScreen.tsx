@@ -4,6 +4,7 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { AppTopBar } from '../components/AppTopBar';
 import { CampusActionStudio } from '../components/CampusActionStudio';
+import { ErrorBoundary } from '../components/ErrorBoundary';
 import { colors, fontFamily, radii } from '../theme/tokens';
 
 type HistoryRouteParams = {
@@ -30,12 +31,14 @@ export function HistoryScreen() {
           </Text>
         </View>
 
-        <CampusActionStudio
-          autoOpenFocusedClaimMessages={Boolean(route.params?.autoOpenMessages)}
-          focusClaimNonce={route.params?.focusNonce ?? 0}
-          focusClaimRequestId={route.params?.focusRequestId}
-          layout="history"
-        />
+        <ErrorBoundary fallbackMessage="Claim history encountered an error">
+          <CampusActionStudio
+            autoOpenFocusedClaimMessages={Boolean(route.params?.autoOpenMessages)}
+            focusClaimNonce={route.params?.focusNonce ?? 0}
+            focusClaimRequestId={route.params?.focusRequestId}
+            layout="history"
+          />
+        </ErrorBoundary>
       </ScrollView>
     </SafeAreaView>
   );

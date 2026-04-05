@@ -177,6 +177,37 @@ function safeNumber(value: unknown): number {
   return 0;
 }
 
+function isMissingMessagesTableIssue(message: string): boolean {
+  const normalized = safeString(message).toLowerCase();
+  if (!normalized) {
+    return false;
+  }
+
+  // Direct table-name check
+  if (
+    normalized.includes('match_request_messages') &&
+    (normalized.includes('schema cache') ||
+      normalized.includes('could not find the table') ||
+      normalized.includes('does not exist') ||
+      normalized.includes('relation') ||
+      normalized.includes('42p01'))
+  ) {
+    return true;
+  }
+
+  // Backend warning string check
+  if (
+    normalized.includes('chat database') &&
+    (normalized.includes('not deployed') ||
+      normalized.includes('migration') ||
+      normalized.includes('pending'))
+  ) {
+    return true;
+  }
+
+  return false;
+}
+
 function formatRelativeTime(iso: string | null): string {
   if (!iso) {
     return 'recently';
@@ -426,6 +457,7 @@ export function CampusActionStudio({
   const { user } = useUser();
   const getTokenRef = useRef(getToken);
   const lastHandledClaimIntentNonceRef = useRef(0);
+  const localMessagesByClaimRef = useRef<Record<string, ClaimMessage[]>>({});
   const currentUserId = safeString(user?.id);
 
   const backendBaseUrl = useMemo(() => backendEnv.backendUrl.replace(/\/+$/, ''), []);
@@ -592,7 +624,7 @@ export function CampusActionStudio({
 
   const authedJsonRequest = useCallback(
     async (path: string, body: Record<string, unknown>) => {
-      const token = await getTokenRef.current();
+      const token = await getTokenRef.current().catch(() => null);
 
       if (!token) {
         throw new Error('You need to be signed in to continue.');
@@ -618,7 +650,7 @@ export function CampusActionStudio({
 
   const authedGetRequest = useCallback(
     async (path: string) => {
-      const token = await getTokenRef.current();
+      const token = await getTokenRef.current().catch(() => null);
 
       if (!token) {
         throw new Error('You need to be signed in to continue.');
@@ -1511,6 +1543,9 @@ export function CampusActionStudio({
 
         setMessages(rows);
         setIsMessagingActive(Boolean(payload.messagingActive));
+
+        const warningMessage = safeString(payload.warning);
+        setMessagesError(warningMessage);
       } catch (error) {
         const message =
           typeof error === 'object' &&
@@ -1519,6 +1554,16 @@ export function CampusActionStudio({
           typeof (error as { message?: unknown }).message === 'string'
             ? (error as { message: string }).message
             : 'Failed to load messages.';
+
+        if (isMissingMessagesTableIssue(message)) {
+          const localRows = localMessagesByClaimRef.current[claim.id] ?? [];
+          setMessages(localRows);
+          setIsMessagingActive(claim.status !== 'picked_up');
+          setMessagesError(
+            'Messages are saved locally on this device for now.',
+          );
+          return;
+        }
 
         setMessagesError(message);
       } finally {
@@ -1565,6 +1610,7 @@ export function CampusActionStudio({
 
       setMessagesInput('');
       setIsMessagingActive(Boolean(payload.messagingActive));
+      setMessagesError(safeString(payload.warning));
     } catch (error) {
       const messageText =
         typeof error === 'object' &&
@@ -1574,11 +1620,32 @@ export function CampusActionStudio({
           ? (error as { message: string }).message
           : 'Failed to send message.';
 
+      if (isMissingMessagesTableIssue(messageText)) {
+        const fallbackMessage: ClaimMessage = {
+          id: `local-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
+          sender_user_id: currentUserId,
+          message_text: message,
+          created_at: new Date().toISOString(),
+        };
+
+        const localRows = [...(localMessagesByClaimRef.current[messagesClaim.id] ?? []), fallbackMessage]
+          .slice(-200);
+
+        localMessagesByClaimRef.current[messagesClaim.id] = localRows;
+        setMessages(localRows);
+        setMessagesInput('');
+        setIsMessagingActive(messagesClaim.status !== 'picked_up');
+        setMessagesError(
+          'Message saved locally on this device.',
+        );
+        return;
+      }
+
       setMessagesError(messageText);
     } finally {
       setIsSendingMessage(false);
     }
-  }, [authedJsonRequest, messagesClaim, messagesInput]);
+  }, [authedJsonRequest, currentUserId, messagesClaim, messagesInput]);
 
   useEffect(() => {
     if (!focusClaimRequestId || !focusClaimNonce) {
@@ -1757,7 +1824,11 @@ export function CampusActionStudio({
                 </Text>
 
                 {claim.proof_image_url ? (
-                  <Image source={{ uri: claim.proof_image_url }} style={styles.claimProofImage} />
+                  <Image
+                    resizeMode="contain"
+                    source={{ uri: claim.proof_image_url }}
+                    style={styles.claimProofImage}
+                  />
                 ) : null}
 
                 <Text numberOfLines={1} style={styles.claimMetaSubText}>
@@ -1875,10 +1946,28 @@ export function CampusActionStudio({
             </View>
           </View>
 
+          <View style={styles.historyOverviewRow}>
+            <View style={styles.historyOverviewCard}>
+              <Text style={styles.historyOverviewValue}>{historyOverview.all}</Text>
+              <Text style={styles.historyOverviewLabel}>Total</Text>
+            </View>
+            <View style={styles.historyOverviewCard}>
+              <Text style={styles.historyOverviewValue}>{historyOverview.active}</Text>
+              <Text style={styles.historyOverviewLabel}>Active</Text>
+            </View>
+            <View style={[styles.historyOverviewCard, { marginRight: 0 }]}>
+              <Text style={styles.historyOverviewValue}>{historyOverview.completed}</Text>
+              <Text style={styles.historyOverviewLabel}>Completed</Text>
+            </View>
+          </View>
+
           <View style={styles.historyFilterRow}>
             <Pressable
               onPress={() => setHistoryFilter('all')}
-              style={[styles.historyFilterChip, historyFilter === 'all' ? styles.historyFilterChipActive : undefined]}
+              style={[
+                styles.historyFilterChip,
+                historyFilter === 'all' ? styles.historyFilterChipActive : undefined,
+              ]}
             >
               <MaterialIcons
                 color={historyFilter === 'all' ? colors.onPrimary : colors.onSurfaceVariant}
@@ -1891,13 +1980,24 @@ export function CampusActionStudio({
                   historyFilter === 'all' ? styles.historyFilterTextActive : undefined,
                 ]}
               >
-                ALL ({historyOverview.all})
+                All
+              </Text>
+              <Text
+                style={[
+                  styles.historyFilterCount,
+                  historyFilter === 'all' ? styles.historyFilterCountActive : undefined,
+                ]}
+              >
+                {historyOverview.all}
               </Text>
             </Pressable>
 
             <Pressable
               onPress={() => setHistoryFilter('active')}
-              style={[styles.historyFilterChip, historyFilter === 'active' ? styles.historyFilterChipActive : undefined]}
+              style={[
+                styles.historyFilterChip,
+                historyFilter === 'active' ? styles.historyFilterChipActive : undefined,
+              ]}
             >
               <MaterialIcons
                 color={historyFilter === 'active' ? colors.onPrimary : colors.onSurfaceVariant}
@@ -1910,7 +2010,15 @@ export function CampusActionStudio({
                   historyFilter === 'active' ? styles.historyFilterTextActive : undefined,
                 ]}
               >
-                ACTIVE ({historyOverview.active})
+                Active
+              </Text>
+              <Text
+                style={[
+                  styles.historyFilterCount,
+                  historyFilter === 'active' ? styles.historyFilterCountActive : undefined,
+                ]}
+              >
+                {historyOverview.active}
               </Text>
             </Pressable>
 
@@ -1918,6 +2026,7 @@ export function CampusActionStudio({
               onPress={() => setHistoryFilter('completed')}
               style={[
                 styles.historyFilterChip,
+                { marginRight: 0 },
                 historyFilter === 'completed' ? styles.historyFilterChipActive : undefined,
               ]}
             >
@@ -1932,7 +2041,15 @@ export function CampusActionStudio({
                   historyFilter === 'completed' ? styles.historyFilterTextActive : undefined,
                 ]}
               >
-                COMPLETED ({historyOverview.completed})
+                Completed
+              </Text>
+              <Text
+                style={[
+                  styles.historyFilterCount,
+                  historyFilter === 'completed' ? styles.historyFilterCountActive : undefined,
+                ]}
+              >
+                {historyOverview.completed}
               </Text>
             </Pressable>
           </View>
@@ -1942,6 +2059,7 @@ export function CampusActionStudio({
               const statusTone = resolveStatusTone(entry.status);
               const isOwner = safeString(entry.found_item.created_by) === currentUserId;
               const isClaimant = safeString(entry.claimant_user_id) === currentUserId;
+              const roleLabel = isOwner ? 'Uploader' : isClaimant ? 'Claimant' : 'Participant';
               const canMessage = entry.status !== 'picked_up';
               const canUndoPickup =
                 isOwner &&
@@ -1963,44 +2081,67 @@ export function CampusActionStudio({
                   ) : null}
 
                   <View style={styles.historyTopRow}>
-                    <Text numberOfLines={1} style={styles.historyTitle}>
-                      {entry.found_item.title}
-                    </Text>
+                    <View style={styles.historyTitleWrap}>
+                      <Text numberOfLines={1} style={styles.historyTitle}>
+                        {entry.found_item.title}
+                      </Text>
+                      <View style={styles.historyRoleTag}>
+                        <MaterialIcons color={colors.onSurfaceVariant} name="person-outline" size={12} />
+                        <Text style={styles.historyRoleTagText}>{roleLabel}</Text>
+                      </View>
+                    </View>
                     <Text style={[styles.historyStatus, { backgroundColor: statusTone.bg, color: statusTone.fg }]}>
                       {formatStatusLabel(entry.status)}
                     </Text>
                   </View>
 
-                  <Text numberOfLines={1} style={styles.historyMeta}>
-                    Score {entry.match_score}% • {formatRelativeTime(entry.created_at)}
-                  </Text>
-
-                  <Text numberOfLines={1} style={styles.historyMeta}>
-                    {isOwner ? 'You are uploader' : isClaimant ? 'You are claimant' : 'Claim participant'}
-                  </Text>
-
-                  {entry.reviewed_at ? (
-                    <Text numberOfLines={1} style={styles.historyMeta}>
-                      Reviewed {formatRelativeTime(entry.reviewed_at)}
-                    </Text>
-                  ) : null}
-
-                  {entry.status === 'picked_up' && entry.pickup_confirmed_at ? (
-                    <Text numberOfLines={1} style={styles.historyMeta}>
-                      Picked up {formatRelativeTime(entry.pickup_confirmed_at)}
-                    </Text>
-                  ) : null}
+                  <View style={styles.historyMetaWrap}>
+                    <View style={styles.historyMetaPill}>
+                      <MaterialIcons color={colors.primary} name="percent" size={13} />
+                      <Text style={styles.historyMetaPillText}>{entry.match_score}% match</Text>
+                    </View>
+                    <View style={styles.historyMetaPill}>
+                      <MaterialIcons color={colors.onSurfaceVariant} name="schedule" size={13} />
+                      <Text style={styles.historyMetaPillText}>Submitted {formatRelativeTime(entry.created_at)}</Text>
+                    </View>
+                    {entry.reviewed_at ? (
+                      <View style={styles.historyMetaPill}>
+                        <MaterialIcons color={colors.success} name="verified" size={13} />
+                        <Text style={styles.historyMetaPillText}>Reviewed {formatRelativeTime(entry.reviewed_at)}</Text>
+                      </View>
+                    ) : (
+                      <View style={styles.historyMetaPill}>
+                        <MaterialIcons color={colors.onSurfaceVariant} name="hourglass-empty" size={13} />
+                        <Text style={styles.historyMetaPillText}>Awaiting review</Text>
+                      </View>
+                    )}
+                    {entry.status === 'picked_up' && entry.pickup_confirmed_at ? (
+                      <View style={styles.historyMetaPill}>
+                        <MaterialIcons color={colors.success} name="task-alt" size={13} />
+                        <Text style={styles.historyMetaPillText}>
+                          Picked up {formatRelativeTime(entry.pickup_confirmed_at)}
+                        </Text>
+                      </View>
+                    ) : null}
+                  </View>
 
                   {entry.proof_image_url ? (
-                    <Image source={{ uri: entry.proof_image_url }} style={styles.historyProofImage} />
+                    <View style={styles.historyProofWrap}>
+                      <Text style={styles.historyProofLabel}>Proof Image</Text>
+                      <Image
+                        resizeMode="contain"
+                        source={{ uri: entry.proof_image_url }}
+                        style={styles.historyProofImage}
+                      />
+                    </View>
                   ) : null}
 
                   {(canMessage || canUndoPickup || (isOwner && entry.status === 'approved')) ? (
                     <View style={styles.historyActionsRow}>
                       {canMessage ? (
-                        <Pressable onPress={() => void openMessages(entry)} style={styles.messageButton}>
+                        <Pressable onPress={() => void openMessages(entry)} style={styles.historyMessageButton}>
                           <MaterialIcons color={colors.onSurfaceVariant} name="chat-bubble-outline" size={14} />
-                          <Text style={styles.messageButtonText}>Message</Text>
+                          <Text style={styles.historyMessageButtonText}>Message</Text>
                         </Pressable>
                       ) : null}
 
@@ -2008,7 +2149,7 @@ export function CampusActionStudio({
                         <Pressable
                           disabled={Boolean(isConfirmingPickupId)}
                           onPress={() => void confirmPickup(entry.id)}
-                          style={styles.pickupButtonCompact}
+                          style={[styles.pickupButtonCompact, styles.historyPrimaryActionButton]}
                         >
                           {isConfirmingPickupId === entry.id ? (
                             <ActivityIndicator color={colors.onPrimary} size="small" />
@@ -2944,8 +3085,11 @@ const styles = StyleSheet.create({
     marginTop: 5,
   },
   claimProofImage: {
+    backgroundColor: '#F4F6FA',
+    borderColor: '#E2E5EB',
+    borderWidth: 1,
     borderRadius: 10,
-    height: 124,
+    height: 148,
     marginTop: 8,
     width: '100%',
   },
@@ -3032,24 +3176,56 @@ const styles = StyleSheet.create({
     fontSize: 12,
     marginLeft: 4,
   },
-  historyFilterRow: {
-    backgroundColor: '#F4F6FB',
-    borderRadius: radii.pill,
+  historyOverviewRow: {
     flexDirection: 'row',
+    justifyContent: 'space-between',
     marginBottom: 10,
-    padding: 4,
+  },
+  historyOverviewCard: {
+    alignItems: 'center',
+    backgroundColor: '#F6F9FF',
+    borderColor: '#DCE6FA',
+    borderRadius: radii.md,
+    borderWidth: 1,
+    flex: 1,
+    marginRight: 8,
+    paddingVertical: 10,
+  },
+  historyOverviewValue: {
+    color: colors.primary,
+    fontFamily: fontFamily.headlineBold,
+    fontSize: 16,
+  },
+  historyOverviewLabel: {
+    color: colors.onSurfaceVariant,
+    fontFamily: fontFamily.bodySemiBold,
+    fontSize: 11,
+    marginTop: 2,
+    textTransform: 'uppercase',
+  },
+  historyFilterRow: {
+    alignItems: 'center',
+    backgroundColor: '#F8FAFF',
+    borderColor: '#DEE7FA',
+    borderRadius: radii.lg,
+    borderWidth: 1,
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    marginBottom: 10,
+    padding: 6,
   },
   historyFilterChip: {
     alignItems: 'center',
-    backgroundColor: 'transparent',
-    borderColor: 'transparent',
+    backgroundColor: '#EDF2FD',
+    borderColor: '#D9E4F8',
     borderRadius: radii.pill,
     borderWidth: 1,
-    flex: 1,
-    marginRight: 6,
     flexDirection: 'row',
     justifyContent: 'center',
-    paddingHorizontal: 8,
+    marginVertical: 3,
+    marginRight: '2%',
+    minWidth: '31%',
+    paddingHorizontal: 9,
     paddingVertical: 8,
   },
   historyFilterChipActive: {
@@ -3059,20 +3235,30 @@ const styles = StyleSheet.create({
   historyFilterText: {
     color: colors.onSurfaceVariant,
     fontFamily: fontFamily.bodySemiBold,
-    fontSize: 10,
+    fontSize: 11,
     marginLeft: 4,
-    textTransform: 'uppercase',
   },
   historyFilterTextActive: {
     color: colors.onPrimary,
   },
+  historyFilterCount: {
+    color: colors.onSurfaceVariant,
+    fontFamily: fontFamily.bodySemiBold,
+    fontSize: 10,
+    marginLeft: 6,
+    opacity: 0.72,
+  },
+  historyFilterCountActive: {
+    color: colors.onPrimary,
+    opacity: 1,
+  },
   historyCard: {
-    backgroundColor: colors.surface,
-    borderColor: 'rgba(118, 118, 131, 0.16)',
-    borderRadius: radii.md,
+    backgroundColor: '#FCFDFF',
+    borderColor: '#DCE5F7',
+    borderRadius: radii.lg,
     borderWidth: 1,
-    marginBottom: 10,
-    padding: 11,
+    marginBottom: 12,
+    padding: 12,
   },
   historyCardFocused: {
     backgroundColor: '#F1F6FF',
@@ -3097,16 +3283,35 @@ const styles = StyleSheet.create({
     textTransform: 'uppercase',
   },
   historyTopRow: {
-    alignItems: 'center',
+    alignItems: 'flex-start',
     flexDirection: 'row',
     justifyContent: 'space-between',
   },
+  historyTitleWrap: {
+    flex: 1,
+    marginRight: 8,
+  },
   historyTitle: {
     color: colors.onSurface,
-    flex: 1,
     fontFamily: fontFamily.headlineSemiBold,
-    fontSize: 13,
-    marginRight: 8,
+    fontSize: 14,
+  },
+  historyRoleTag: {
+    alignItems: 'center',
+    alignSelf: 'flex-start',
+    backgroundColor: '#EEF2FA',
+    borderRadius: radii.pill,
+    flexDirection: 'row',
+    marginTop: 6,
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+  },
+  historyRoleTagText: {
+    color: colors.onSurfaceVariant,
+    fontFamily: fontFamily.bodySemiBold,
+    fontSize: 10,
+    marginLeft: 4,
+    textTransform: 'uppercase',
   },
   historyStatus: {
     borderRadius: radii.pill,
@@ -3123,16 +3328,76 @@ const styles = StyleSheet.create({
     fontSize: 11,
     marginTop: 4,
   },
+  historyMetaWrap: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    marginTop: 8,
+  },
+  historyMetaPill: {
+    alignItems: 'center',
+    backgroundColor: '#F3F6FD',
+    borderColor: '#E0E7F6',
+    borderRadius: radii.pill,
+    borderWidth: 1,
+    flexDirection: 'row',
+    marginBottom: 7,
+    marginRight: 7,
+    paddingHorizontal: 9,
+    paddingVertical: 5,
+  },
+  historyMetaPillText: {
+    color: colors.onSurfaceVariant,
+    fontFamily: fontFamily.bodyMedium,
+    fontSize: 11,
+    marginLeft: 5,
+  },
+  historyProofWrap: {
+    marginTop: 3,
+  },
+  historyProofLabel: {
+    color: colors.onSurfaceVariant,
+    fontFamily: fontFamily.bodySemiBold,
+    fontSize: 10,
+    letterSpacing: 0.2,
+    marginBottom: 6,
+    textTransform: 'uppercase',
+  },
   historyProofImage: {
+    backgroundColor: '#F4F6FA',
+    borderColor: '#E2E5EB',
+    borderWidth: 1,
     borderRadius: 10,
-    height: 108,
-    marginTop: 7,
+    height: 144,
     width: '100%',
   },
   historyActionsRow: {
     alignItems: 'center',
     flexDirection: 'row',
-    marginTop: 8,
+    flexWrap: 'wrap',
+    marginTop: 10,
+  },
+  historyMessageButton: {
+    alignItems: 'center',
+    backgroundColor: colors.surfaceLow,
+    borderRadius: radii.pill,
+    flexDirection: 'row',
+    justifyContent: 'center',
+    marginBottom: 8,
+    marginRight: 8,
+    minHeight: 36,
+    minWidth: 96,
+    paddingHorizontal: 11,
+    paddingVertical: 8,
+  },
+  historyMessageButtonText: {
+    color: colors.onSurfaceVariant,
+    fontFamily: fontFamily.bodySemiBold,
+    fontSize: 12,
+    marginLeft: 4,
+  },
+  historyPrimaryActionButton: {
+    marginBottom: 8,
+    marginRight: 8,
   },
   undoPickupButton: {
     alignItems: 'center',
@@ -3140,9 +3405,10 @@ const styles = StyleSheet.create({
     borderRadius: radii.pill,
     flexDirection: 'row',
     justifyContent: 'center',
+    marginBottom: 8,
+    marginLeft: 0,
     minHeight: 36,
     paddingHorizontal: 10,
-    marginLeft: 8,
   },
   undoPickupButtonText: {
     color: colors.primary,

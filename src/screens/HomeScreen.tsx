@@ -22,6 +22,7 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { AppTopBar } from '../components/AppTopBar';
 import { CampusActionStudio } from '../components/CampusActionStudio';
+import { ErrorBoundary } from '../components/ErrorBoundary';
 import { backendEnv } from '../config/env';
 import { buildSupabaseClient } from '../lib/supabase';
 import { colors, fontFamily, radii, shadows } from '../theme/tokens';
@@ -1389,14 +1390,16 @@ export function HomeScreen() {
           <Text style={styles.toolsSubtitle}>
             Report lost items or start a new claim proof flow. Claim history is now in the History tab.
           </Text>
-          <CampusActionStudio
-            claimableItems={claimableItems}
-            claimIntentItemId={claimIntentItemId || undefined}
-            claimIntentNonce={claimIntentNonce}
-            compact
-            layout="quick"
-            onActionsFinished={handleStudioActionsFinished}
-          />
+          <ErrorBoundary fallbackMessage="Quick actions encountered an error">
+            <CampusActionStudio
+              claimableItems={claimableItems}
+              claimIntentItemId={claimIntentItemId || undefined}
+              claimIntentNonce={claimIntentNonce}
+              compact
+              layout="quick"
+              onActionsFinished={handleStudioActionsFinished}
+            />
+          </ErrorBoundary>
         </View>
       </ScrollView>
     </SafeAreaView>
