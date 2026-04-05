@@ -24,6 +24,8 @@ const clerkSecretKey = process.env.CLERK_SECRET_KEY;
 const geminiApiKey = readText(process.env.GEMINI_API_KEY);
 const geminiModel = readText(process.env.GEMINI_MODEL) || 'gemini-1.5-flash';
 const PICKUP_EDIT_WINDOW_MS = 5 * 60 * 1000;
+const MESSAGE_TABLE_NAME = 'match_request_messages';
+const inMemoryMatchRequestMessages = new Map();
 
 if (!supabaseUrl || !serviceRoleKey) {
   throw new Error(
@@ -478,6 +480,54 @@ function resolvePickupEditWindow(pickupConfirmedAt) {
     isEditable: remainingMs > 0,
     remainingSeconds: Math.ceil(remainingMs / 1000),
   };
+}
+
+function isMissingMessagesTableError(error) {
+  const message = readText(error?.message).toLowerCase();
+  const details = readText(error?.details).toLowerCase();
+  const hint = readText(error?.hint).toLowerCase();
+  const code = readText(error?.code).toUpperCase();
+
+  if (code === '42P01') {
+    return true;
+  }
+
+  const combined = `${message} ${details} ${hint}`;
+
+  return (
+    (combined.includes('schema cache') && combined.includes(MESSAGE_TABLE_NAME)) ||
+    (combined.includes(MESSAGE_TABLE_NAME) &&
+      (combined.includes('does not exist') || combined.includes('could not find table')))
+  );
+}
+
+function getInMemoryMessagesForRequest(requestId) {
+  const key = readText(requestId);
+  if (!key) {
+    return [];
+  }
+
+  const rows = inMemoryMatchRequestMessages.get(key);
+  return Array.isArray(rows) ? rows : [];
+}
+
+function appendInMemoryMessage({ requestId, senderUserId, messageText }) {
+  const key = readText(requestId);
+  const sender = readText(senderUserId);
+  const text = readText(messageText);
+
+  const entry = {
+    id: `local-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
+    match_request_id: key,
+    sender_user_id: sender,
+    message_text: text,
+    created_at: new Date().toISOString(),
+  };
+
+  const nextRows = [...getInMemoryMessagesForRequest(key), entry].slice(-200);
+  inMemoryMatchRequestMessages.set(key, nextRows);
+
+  return entry;
 }
 
 async function awardPointsOnce({ userId, points, reason, referenceType, referenceId }) {
@@ -1804,6 +1854,20 @@ app.get('/api/match-requests/:requestId/messages', requireClerkAuth, async (req,
       .limit(200);
 
     if (messagesError) {
+      if (isMissingMessagesTableError(messagesError)) {
+        console.warn('match_request_messages table missing; using in-memory messaging fallback');
+
+        res.json({
+          items: getInMemoryMessagesForRequest(requestId),
+          messagingActive: readText(requestRow.status) !== 'picked_up',
+          requestStatus: readText(requestRow.status),
+          foundItem: requestRow.found_item,
+          warning:
+            'Chat database table is not deployed yet. Messages are temporary until migration 016 is applied.',
+        });
+        return;
+      }
+
       throw messagesError;
     }
 
@@ -1872,6 +1936,25 @@ app.post('/api/match-requests/:requestId/messages', requireClerkAuth, async (req
       .single();
 
     if (insertError) {
+      if (isMissingMessagesTableError(insertError)) {
+        console.warn('match_request_messages table missing; writing message to in-memory fallback');
+
+        const fallbackMessage = appendInMemoryMessage({
+          requestId,
+          senderUserId: req.auth.userId,
+          messageText,
+        });
+
+        res.status(201).json({
+          message: fallbackMessage,
+          messagingActive: readText(requestRow.status) !== 'picked_up',
+          requestStatus: readText(requestRow.status),
+          warning:
+            'Chat database table is not deployed yet. Messages are temporary until migration 016 is applied.',
+        });
+        return;
+      }
+
       throw insertError;
     }
 

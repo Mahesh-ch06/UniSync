@@ -2,5 +2,12 @@
   "extends": "./node_modules/expo/tsconfig.base.json",
   "compilerOptions": {
     "strict": true
-  }
+  },
+  "exclude": [
+    "node_modules",
+    "dist",
+    "ci-check-*",
+    "ci-check-temp",
+    "MobileApp-deploy-*"
+  ]
 }

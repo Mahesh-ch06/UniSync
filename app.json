@@ -4,7 +4,7 @@
     "slug": "unisync",
     "owner": "mahesh0603",
     "scheme": "unisync",
-    "version": "1.0.7",
+    "version": "1.0.6",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
@@ -16,7 +16,7 @@
     },
     "ios": {
       "supportsTablet": true,
-      "buildNumber": "1.0.7"
+      "buildNumber": "1.0.6"
     },
     "android": {
       "adaptiveIcon": {
@@ -26,7 +26,7 @@
       "edgeToEdgeEnabled": true,
       "predictiveBackGestureEnabled": false,
       "package": "com.mahesh0603.MobileApp",
-      "versionCode": 7,
+      "versionCode": 6,
       "permissions": [
         "android.permission.RECORD_AUDIO",
         "android.permission.ACCESS_COARSE_LOCATION",

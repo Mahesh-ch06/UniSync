@@ -183,29 +183,12 @@ function isMissingMessagesTableIssue(message: string): boolean {
     return false;
   }
 
-  // Direct table-name check
-  if (
+  return (
     normalized.includes('match_request_messages') &&
     (normalized.includes('schema cache') ||
       normalized.includes('could not find the table') ||
-      normalized.includes('does not exist') ||
-      normalized.includes('relation') ||
-      normalized.includes('42p01'))
-  ) {
-    return true;
-  }
-
-  // Backend warning string check
-  if (
-    normalized.includes('chat database') &&
-    (normalized.includes('not deployed') ||
-      normalized.includes('migration') ||
-      normalized.includes('pending'))
-  ) {
-    return true;
-  }
-
-  return false;
+      normalized.includes('does not exist'))
+  );
 }
 
 function formatRelativeTime(iso: string | null): string {
@@ -624,7 +607,7 @@ export function CampusActionStudio({
 
   const authedJsonRequest = useCallback(
     async (path: string, body: Record<string, unknown>) => {
-      const token = await getTokenRef.current().catch(() => null);
+      const token = await getTokenRef.current();
 
       if (!token) {
         throw new Error('You need to be signed in to continue.');
@@ -650,7 +633,7 @@ export function CampusActionStudio({
 
   const authedGetRequest = useCallback(
     async (path: string) => {
-      const token = await getTokenRef.current().catch(() => null);
+      const token = await getTokenRef.current();
 
       if (!token) {
         throw new Error('You need to be signed in to continue.');
@@ -1560,7 +1543,7 @@ export function CampusActionStudio({
           setMessages(localRows);
           setIsMessagingActive(claim.status !== 'picked_up');
           setMessagesError(
-            'Messages are saved locally on this device for now.',
+            'Chat database migration is pending. Messages are being kept temporarily on this device.',
           );
           return;
         }
@@ -1636,7 +1619,7 @@ export function CampusActionStudio({
         setMessagesInput('');
         setIsMessagingActive(messagesClaim.status !== 'picked_up');
         setMessagesError(
-          'Message saved locally on this device.',
+          'Chat database migration is pending. Message sent in temporary mode on this device.',
         );
         return;
       }

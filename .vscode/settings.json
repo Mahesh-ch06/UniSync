@@ -1,0 +1,81 @@
+{
+    "java.configuration.updateBuildConfiguration": "disabled",
+    "java.autobuild.enabled": false,
+    "java.import.gradle.enabled": true,
+    "java.import.maven.enabled": false,
+    "java.import.gradle.wrapper.enabled": false,
+    "java.import.gradle.version": "8.14.3",
+    "java.import.gradle.home": "C:\\Users\\mahes\\.gradle\\wrapper\\dists\\gradle-8.14.3-bin\\cv11ve7ro1n3o1j4so8xd9n66\\gradle-8.14.3",
+    "java.gradle.buildServer.enabled": "off",
+    "gradle.nestedProjects": [
+        "android"
+    ],
+    "gradle.autoDetect": "on",
+    "java.jdt.ls.java.home": "C:\\Program Files\\Java\\jdk-21",
+    "java.configuration.runtimes": [
+        {
+            "name": "JavaSE-21",
+            "path": "C:\\Program Files\\Java\\jdk-21",
+            "default": true
+        }
+    ],
+    "java.import.exclusions": [
+        "**/node_modules/**",
+        "**/ci-check-*/**",
+        "**/ci-check-temp/**",
+        "**/MobileApp-deploy-*/**"
+    ],
+    "java.project.resourceFilters": [
+        "node_modules",
+        ".git",
+        ".hg",
+        "CVS",
+        "dist",
+        "tmp",
+        "temp",
+        "ci-check-*",
+        "ci-check-temp"
+    ],
+    "java.errors.incompleteClasspath.severity": "ignore",
+    "files.associations": {
+        "*.java": "plaintext",
+        "*.gradle": "plaintext",
+        "*.gradle.kts": "plaintext",
+        "**/node_modules/**/*.gradle": "plaintext",
+        "**/node_modules/**/*.gradle.kts": "plaintext"
+    },
+    "files.exclude": {
+        "**/ci-check-*/**": true,
+        "**/ci-check-temp/**": true,
+        "**/MobileApp-deploy-*/**": true
+    },
+    "problems.exclude": {
+        "**/node_modules/**": true,
+        "**/*.gradle": true,
+        "**/*.gradle.kts": true,
+        "**/ci-check-*/**": true,
+        "**/ci-check-temp/**": true,
+        "**/MobileApp-deploy-*/**": true
+    },
+    "search.exclude": {
+        "**/node_modules/**": true,
+        "**/ci-check-*/**": true,
+        "**/ci-check-temp/**": true,
+        "**/MobileApp-deploy-*/**": true
+    },
+    "files.watcherExclude": {
+        "**/node_modules/**": true,
+        "**/ci-check-*/**": true,
+        "**/ci-check-temp/**": true,
+        "**/MobileApp-deploy-*/**": true
+    },
+    "typescript.tsserver.watchOptions": {
+        "excludeDirectories": [
+            "**/node_modules/**",
+            "**/ci-check-*/**",
+            "**/ci-check-temp/**",
+            "**/MobileApp-deploy-*/**"
+        ]
+    },
+    "java.compile.nullAnalysis.mode": "automatic"
+}
