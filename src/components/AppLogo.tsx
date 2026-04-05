@@ -9,6 +9,7 @@ type AppLogoProps = {
   showWordmark?: boolean;
   wordmark?: string;
   textColor?: string;
+  wordmarkSize?: number;
 };
 
 export function AppLogo({
@@ -16,6 +17,7 @@ export function AppLogo({
   showWordmark = true,
   wordmark = 'UniSync',
   textColor = '#070B2B',
+  wordmarkSize = 23,
 }: AppLogoProps) {
   const iconSize = Math.max(Math.floor(size * 0.5), 14);
 
@@ -33,7 +35,7 @@ export function AppLogo({
       </View>
 
       {showWordmark ? (
-        <Text style={[styles.wordmark, { color: textColor }]}>{wordmark}</Text>
+        <Text style={[styles.wordmark, { color: textColor, fontSize: wordmarkSize }]}>{wordmark}</Text>
       ) : null}
     </View>
   );

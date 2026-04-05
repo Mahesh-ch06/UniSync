@@ -1,7 +1,7 @@
 import MaterialIcons from '@expo/vector-icons/MaterialIcons';
 import { useAuth } from '@clerk/clerk-expo';
 import { useUser } from '@clerk/clerk-expo';
-import { NavigationProp, useNavigation } from '@react-navigation/native';
+import { NavigationProp, useFocusEffect, useNavigation } from '@react-navigation/native';
 import * as SecureStore from 'expo-secure-store';
 import * as ImagePicker from 'expo-image-picker';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
@@ -24,6 +24,12 @@ import { AppTopBar } from '../components/AppTopBar';
 import { CampusActionStudio } from '../components/CampusActionStudio';
 import { ErrorBoundary } from '../components/ErrorBoundary';
 import { backendEnv } from '../config/env';
+import {
+  mapHistoryRowsToNotifications,
+  NOTIFICATION_SEEN_STORAGE_PREFIX,
+  type NotificationEntry,
+} from '../lib/notifications';
+import { useNotificationBadge } from '../lib/notificationBadge';
 import { buildSupabaseClient } from '../lib/supabase';
 import { colors, fontFamily, radii, shadows } from '../theme/tokens';
 
@@ -76,6 +82,9 @@ type HomeTabNavigationParams = {
     focusNonce?: number;
     autoOpenMessages?: boolean;
   } | undefined;
+  Profile: undefined;
+  Notifications: undefined;
+  Settings: undefined;
 };
 
 function readText(value: unknown): string | null {
@@ -403,6 +412,7 @@ function FoundItemCard({
 export function HomeScreen() {
   const { getToken } = useAuth();
   const { user } = useUser();
+  const { setUnreadCount } = useNotificationBadge();
   const navigation = useNavigation<NavigationProp<HomeTabNavigationParams>>();
   const getTokenRef = useRef(getToken);
   const approvedPopupScale = useRef(new Animated.Value(0.86)).current;
@@ -423,6 +433,8 @@ export function HomeScreen() {
   const [claimIntentNonce, setClaimIntentNonce] = useState(0);
   const [focusedItemId, setFocusedItemId] = useState('');
   const [approvedClaimReminders, setApprovedClaimReminders] = useState<ApprovedClaimReminder[]>([]);
+  const [notificationEntries, setNotificationEntries] = useState<NotificationEntry[]>([]);
+  const [seenNotificationIds, setSeenNotificationIds] = useState<string[]>([]);
   const [approvedPopupSeenRequestIds, setApprovedPopupSeenRequestIds] = useState<string[]>([]);
   const [approvedPopupReminder, setApprovedPopupReminder] = useState<ApprovedClaimReminder | null>(null);
   const [isApprovedPopupVisible, setIsApprovedPopupVisible] = useState(false);
@@ -441,6 +453,45 @@ export function HomeScreen() {
   const approvedPopupStorageKey = currentUserId
     ? `${APPROVED_POPUP_STORAGE_PREFIX}:${currentUserId}`
     : '';
+  const notificationSeenStorageKey = currentUserId
+    ? `${NOTIFICATION_SEEN_STORAGE_PREFIX}:${currentUserId}`
+    : '';
+
+  const loadSeenNotifications = useCallback(async () => {
+    if (!notificationSeenStorageKey) {
+      setSeenNotificationIds([]);
+      return;
+    }
+
+    try {
+      const serialized = await SecureStore.getItemAsync(notificationSeenStorageKey);
+      const parsed = serialized ? (JSON.parse(serialized) as unknown) : [];
+
+      if (!Array.isArray(parsed)) {
+        setSeenNotificationIds([]);
+        return;
+      }
+
+      const normalized = parsed
+        .map((value) => (typeof value === 'string' ? value.trim() : ''))
+        .filter((value) => Boolean(value));
+
+      setSeenNotificationIds(normalized);
+    } catch {
+      setSeenNotificationIds([]);
+    }
+  }, [notificationSeenStorageKey]);
+
+  useEffect(() => {
+    void loadSeenNotifications();
+  }, [loadSeenNotifications]);
+
+  useFocusEffect(
+    useCallback(() => {
+      void loadSeenNotifications();
+      return undefined;
+    }, [loadSeenNotifications]),
+  );
 
   useEffect(() => {
     let isActive = true;
@@ -647,6 +698,15 @@ export function HomeScreen() {
     };
   }, [allItems]);
 
+  const homeUnreadNotificationCount = useMemo(
+    () => notificationEntries.filter((entry) => !seenNotificationIds.includes(entry.id)).length,
+    [notificationEntries, seenNotificationIds],
+  );
+
+  useEffect(() => {
+    setUnreadCount(homeUnreadNotificationCount);
+  }, [homeUnreadNotificationCount, setUnreadCount]);
+
   const loadItems = useCallback(async (options?: { soft?: boolean }) => {
     const soft = options?.soft ?? false;
 
@@ -692,6 +752,8 @@ export function HomeScreen() {
             items?: Record<string, unknown>[];
           };
 
+          setNotificationEntries(mapHistoryRowsToNotifications(historyPayload.items, currentUserId, 80));
+
           const reminders = Array.isArray(historyPayload.items)
             ? historyPayload.items
                 .map((row) => {
@@ -732,6 +794,7 @@ export function HomeScreen() {
           setApprovedClaimReminders(reminders);
         } else {
           setApprovedClaimReminders([]);
+          setNotificationEntries([]);
         }
 
         return;
@@ -743,6 +806,7 @@ export function HomeScreen() {
       if (!client) {
         setErrorText('Supabase is not configured yet. Add keys in your .env file.');
         setApprovedClaimReminders([]);
+        setNotificationEntries([]);
 
         if (!soft) {
           setAllItems([]);
@@ -763,6 +827,7 @@ export function HomeScreen() {
 
       setAllItems((data ?? []).map((row) => mapRowToItem(row as Record<string, unknown>)));
       setApprovedClaimReminders([]);
+      setNotificationEntries([]);
     } catch (error) {
       const message =
         typeof error === 'object' &&
@@ -779,6 +844,7 @@ export function HomeScreen() {
       }
 
       setApprovedClaimReminders([]);
+      setNotificationEntries([]);
     } finally {
       if (!soft) {
         setIsLoading(false);
@@ -999,7 +1065,14 @@ export function HomeScreen() {
 
   return (
     <SafeAreaView edges={['top']} style={styles.safeArea}>
-      <AppTopBar leftIcon="menu" title="UniSync" />
+      <AppTopBar
+        leftIcon="person"
+        onLeftPress={() => navigation.navigate('Profile')}
+        onRightPress={() => navigation.navigate('Notifications')}
+        rightBadgeCount={homeUnreadNotificationCount}
+        rightIcon={homeUnreadNotificationCount > 0 ? 'notifications' : 'notifications-none'}
+        title="UniSync"
+      />
 
       <ScrollView
         contentContainerStyle={styles.content}

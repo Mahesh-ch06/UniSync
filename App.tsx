@@ -28,12 +28,15 @@ import { SafeAreaProvider } from 'react-native-safe-area-context';
 
 import { backendEnv, isBackendConfigured, missingEnvKeys } from './src/config/env';
 import { ErrorBoundary } from './src/components/ErrorBoundary';
+import { NotificationBadgeProvider, useNotificationBadge } from './src/lib/notificationBadge';
 import { AuthScreen } from './src/screens/AuthScreen';
 import { HomeScreen } from './src/screens/HomeScreen';
 import { HistoryScreen } from './src/screens/HistoryScreen';
 import { MapScreen } from './src/screens/MapScreen';
+import { NotificationsScreen } from './src/screens/NotificationsScreen';
 import { ProfileScreen } from './src/screens/ProfileScreen';
 import { ReportScreen } from './src/screens/ReportScreen';
+import { SettingsScreen } from './src/screens/SettingsScreen';
 import { CompleteNameScreen } from './src/screens/CompleteNameScreen';
 import { SetupScreen } from './src/screens/SetupScreen';
 import { colors, fontFamily } from './src/theme/tokens';
@@ -49,6 +52,8 @@ type RootTabsParamList = {
     autoOpenMessages?: boolean;
   } | undefined;
   Profile: undefined;
+  Notifications: undefined;
+  Settings: undefined;
 };
 
 const Tab = createBottomTabNavigator<RootTabsParamList>();
@@ -59,6 +64,8 @@ const tabIcons: Record<keyof RootTabsParamList, keyof typeof MaterialIcons.glyph
   Report: 'add-circle',
   History: 'history',
   Profile: 'person',
+  Notifications: 'notifications-none',
+  Settings: 'settings',
 };
 
 const tabLabels: Record<keyof RootTabsParamList, string> = {
@@ -67,6 +74,8 @@ const tabLabels: Record<keyof RootTabsParamList, string> = {
   Report: 'Report',
   History: 'History',
   Profile: 'Profile',
+  Notifications: 'Notifications',
+  Settings: 'Settings',
 };
 
 const navigationTheme = {
@@ -77,7 +86,36 @@ const navigationTheme = {
   },
 };
 
-function AppTabs() {
+function TabIconWithBadge({
+  badgeCount,
+  color,
+  focused,
+  iconName,
+}: {
+  badgeCount: number;
+  color: string;
+  focused: boolean;
+  iconName: keyof typeof MaterialIcons.glyphMap;
+}) {
+  const safeBadgeCount = Math.max(0, Math.floor(badgeCount));
+
+  return (
+    <View style={styles.tabIconWrap}>
+      <MaterialIcons color={color} name={iconName} size={focused ? 23 : 21} />
+      {safeBadgeCount > 0 ? (
+        <View style={styles.tabIconBadge}>
+          <Text style={styles.tabIconBadgeText}>
+            {safeBadgeCount > 99 ? '99+' : String(safeBadgeCount)}
+          </Text>
+        </View>
+      ) : null}
+    </View>
+  );
+}
+
+function AppTabsNavigator() {
+  const { unreadCount } = useNotificationBadge();
+
   return (
     <Tab.Navigator
       screenOptions={(
@@ -92,8 +130,16 @@ function AppTabs() {
         tabBarInactiveTintColor: '#8C8F9B',
         tabBarIcon: ({ color, focused }: { color: string; focused: boolean }) => {
           const iconName = tabIcons[route.name as keyof RootTabsParamList];
+          const badgeCount = route.name === 'Home' ? unreadCount : 0;
 
-          return <MaterialIcons color={color} name={iconName} size={focused ? 23 : 21} />;
+          return (
+            <TabIconWithBadge
+              badgeCount={badgeCount}
+              color={color}
+              focused={focused}
+              iconName={iconName}
+            />
+          );
         },
       })}
     >
@@ -132,7 +178,33 @@ function AppTabs() {
           tabBarLabel: tabLabels.Profile,
         }}
       />
+      <Tab.Screen
+        component={NotificationsScreen}
+        name="Notifications"
+        options={{
+          tabBarButton: () => null,
+          tabBarItemStyle: { display: 'none' },
+          tabBarStyle: { display: 'none' },
+        }}
+      />
+      <Tab.Screen
+        component={SettingsScreen}
+        name="Settings"
+        options={{
+          tabBarButton: () => null,
+          tabBarItemStyle: { display: 'none' },
+          tabBarStyle: { display: 'none' },
+        }}
+      />
     </Tab.Navigator>
+  );
+}
+
+function AppTabs() {
+  return (
+    <NotificationBadgeProvider>
+      <AppTabsNavigator />
+    </NotificationBadgeProvider>
   );
 }
 
@@ -257,5 +329,30 @@ const styles = StyleSheet.create({
     letterSpacing: 0.4,
     marginTop: 1,
     textTransform: 'uppercase',
+  },
+  tabIconWrap: {
+    alignItems: 'center',
+    justifyContent: 'center',
+    minWidth: 26,
+    position: 'relative',
+  },
+  tabIconBadge: {
+    alignItems: 'center',
+    backgroundColor: '#D22F27',
+    borderColor: '#FFFFFF',
+    borderRadius: 999,
+    borderWidth: 1.4,
+    justifyContent: 'center',
+    minWidth: 15,
+    paddingHorizontal: 4,
+    position: 'absolute',
+    right: -9,
+    top: -5,
+  },
+  tabIconBadgeText: {
+    color: '#FFFFFF',
+    fontFamily: fontFamily.bodySemiBold,
+    fontSize: 8,
+    lineHeight: 11,
   },
 });

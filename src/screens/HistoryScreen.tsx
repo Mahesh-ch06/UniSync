@@ -1,4 +1,6 @@
+import type { BottomTabNavigationProp } from '@react-navigation/bottom-tabs';
 import { RouteProp, useRoute } from '@react-navigation/native';
+import { useNavigation } from '@react-navigation/native';
 import { ScrollView, StyleSheet, Text, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
@@ -16,12 +18,28 @@ type HistoryRouteParams = {
 
 type HistoryRoute = RouteProp<{ History: HistoryRouteParams | undefined }, 'History'>;
 
+type HistoryTabParamList = {
+  Home: undefined;
+  Map: undefined;
+  Report: undefined;
+  History: HistoryRouteParams | undefined;
+  Profile: undefined;
+  Settings: undefined;
+};
+
 export function HistoryScreen() {
   const route = useRoute<HistoryRoute>();
+  const navigation = useNavigation<BottomTabNavigationProp<HistoryTabParamList, 'History'>>();
 
   return (
     <SafeAreaView edges={['top']} style={styles.safeArea}>
-      <AppTopBar leftIcon="menu" title="UniSync" />
+      <AppTopBar
+        leftIcon="home"
+        onLeftPress={() => navigation.navigate('Home')}
+        onRightPress={() => navigation.navigate('Settings')}
+        rightIcon="settings"
+        title="UniSync"
+      />
 
       <ScrollView contentContainerStyle={styles.content} showsVerticalScrollIndicator={false}>
         <View style={styles.headerCard}>

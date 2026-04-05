@@ -21,3 +21,8 @@ Run files in numeric order:
 17. 017_verify_match_request_messages.sql (optional)
 18. 018_found_items_claim_visibility.sql
 19. 019_verify_found_items_claim_visibility.sql (optional)
+20. 020_create_user_profiles_and_summary.sql
+21. 021_verify_user_profiles_and_summary.sql (optional)
+22. 022_update_profile_summary_in_progress_and_last_activity.sql
+23. 023_fix_user_profiles_rls_claim_mapping.sql
+24. 024_user_profiles_rls_allow_clerk_session_role.sql

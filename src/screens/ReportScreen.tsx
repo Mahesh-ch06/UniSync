@@ -1,6 +1,9 @@
 import MaterialIcons from '@expo/vector-icons/MaterialIcons';
+import type { BottomTabNavigationProp } from '@react-navigation/bottom-tabs';
+import { useNavigation } from '@react-navigation/native';
+import * as ImagePicker from 'expo-image-picker';
 import { LinearGradient } from 'expo-linear-gradient';
-import { useMemo, useState } from 'react';
+import { useCallback, useMemo, useState } from 'react';
 import { Image, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
@@ -9,11 +12,36 @@ import { colors, fontFamily, radii, shadows } from '../theme/tokens';
 
 const allTags = ['Blue', 'Electronics', 'Apple', 'Case', 'Personalized', 'Small'];
 
+type ReportTabParamList = {
+  Home: undefined;
+  Map: undefined;
+  Report: undefined;
+  History:
+    | {
+        focusRequestId?: string;
+        focusFoundItemId?: string;
+        focusNonce?: number;
+        autoOpenMessages?: boolean;
+      }
+    | undefined;
+  Profile: undefined;
+  Settings: undefined;
+};
+
 export function ReportScreen() {
+  const navigation = useNavigation<BottomTabNavigationProp<ReportTabParamList, 'Report'>>();
   const [selectedTags, setSelectedTags] = useState<string[]>(['Blue', 'Electronics', 'Apple']);
   const [question, setQuestion] = useState('');
+  const [selectedImageUri, setSelectedImageUri] = useState<string | null>(null);
+  const [isPickingImage, setIsPickingImage] = useState(false);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [statusMessage, setStatusMessage] = useState('');
 
   const canSubmit = useMemo(() => question.trim().length > 8, [question]);
+
+  const previewUri =
+    selectedImageUri ||
+    'https://lh3.googleusercontent.com/aida-public/AB6AXuD5orpYUAZ2FU165f--XS5tNxEmJcZa_rgO2SAwnEl6HuIjMATHRMd-T1Q7b-m9x6mfL80YZFImoc436sLb8s1oyvfknVtV-8PScj08_DJxyr8x8p1A8T0hf9u1jipUlSBKBQsl_teW5SgHPybwR5NDRQih7NOWeWZvoqDlydWK8ZeFgRcsOH3q2vQY8OL79qbjUgHQai4nq89nBTheiQSgEHPoC40OGQmlWMWYPQUraLUBFnLB5YoEJR7TC3MkzNeBsrcF6SacPUtC';
 
   const toggleTag = (tag: string) => {
     setSelectedTags((current) => {
@@ -24,15 +52,78 @@ export function ReportScreen() {
     });
   };
 
+  const handlePickImage = useCallback(async () => {
+    if (isPickingImage) {
+      return;
+    }
+
+    setIsPickingImage(true);
+    setStatusMessage('');
+
+    try {
+      const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
+
+      if (!permission.granted) {
+        setStatusMessage('Allow photo access to add an item image.');
+        return;
+      }
+
+      const result = await ImagePicker.launchImageLibraryAsync({
+        mediaTypes: ImagePicker.MediaTypeOptions.Images,
+        allowsEditing: true,
+        quality: 0.8,
+      });
+
+      if (result.canceled || result.assets.length === 0) {
+        return;
+      }
+
+      const uri = result.assets[0]?.uri?.trim() || null;
+      if (!uri) {
+        setStatusMessage('Could not read selected image.');
+        return;
+      }
+
+      setSelectedImageUri(uri);
+      setStatusMessage('Photo added. Fill details and submit your secure report.');
+    } catch {
+      setStatusMessage('Could not open image picker. Please try again.');
+    } finally {
+      setIsPickingImage(false);
+    }
+  }, [isPickingImage]);
+
+  const handleSubmitReport = useCallback(() => {
+    if (!canSubmit || isSubmitting) {
+      return;
+    }
+
+    setIsSubmitting(true);
+    setStatusMessage('Report submitted successfully. AI matching will start shortly.');
+    setQuestion('');
+    setTimeout(() => setIsSubmitting(false), 250);
+  }, [canSubmit, isSubmitting]);
+
+  const handleQuickFillQuestion = useCallback(() => {
+    setQuestion('What sticker or engraving appears on this item?');
+    setStatusMessage('Question template added. You can edit it before submit.');
+  }, []);
+
   return (
     <SafeAreaView edges={['top']} style={styles.safeArea}>
-      <AppTopBar leftIcon="menu" title="UniSync" />
+      <AppTopBar
+        leftIcon="home"
+        onLeftPress={() => navigation.navigate('Home')}
+        onRightPress={() => navigation.navigate('Settings')}
+        rightIcon="settings"
+        title="UniSync"
+      />
 
       <ScrollView contentContainerStyle={styles.content} showsVerticalScrollIndicator={false}>
-        <View style={styles.uploadZone}>
+        <Pressable onPress={() => void handlePickImage()} style={styles.uploadZone}>
           <Image
             source={{
-              uri: 'https://lh3.googleusercontent.com/aida-public/AB6AXuD5orpYUAZ2FU165f--XS5tNxEmJcZa_rgO2SAwnEl6HuIjMATHRMd-T1Q7b-m9x6mfL80YZFImoc436sLb8s1oyvfknVtV-8PScj08_DJxyr8x8p1A8T0hf9u1jipUlSBKBQsl_teW5SgHPybwR5NDRQih7NOWeWZvoqDlydWK8ZeFgRcsOH3q2vQY8OL79qbjUgHQai4nq89nBTheiQSgEHPoC40OGQmlWMWYPQUraLUBFnLB5YoEJR7TC3MkzNeBsrcF6SacPUtC',
+              uri: previewUri,
             }}
             style={styles.uploadImage}
           />
@@ -40,10 +131,12 @@ export function ReportScreen() {
             <View style={styles.uploadIconCircle}>
               <MaterialIcons color={colors.onPrimary} name="photo-camera" size={30} />
             </View>
-            <Text style={styles.uploadTitle}>Add Object Photo</Text>
-            <Text style={styles.uploadHint}>High-quality images aid AI recognition</Text>
+            <Text style={styles.uploadTitle}>{selectedImageUri ? 'Change Photo' : 'Add Object Photo'}</Text>
+            <Text style={styles.uploadHint}>
+              {isPickingImage ? 'Opening gallery...' : 'Tap to choose a clear image for AI matching'}
+            </Text>
           </View>
-        </View>
+        </Pressable>
 
         <View style={styles.sectionHeader}>
           <Text style={styles.sectionTitle}>AI Auto-Tags</Text>
@@ -76,6 +169,11 @@ export function ReportScreen() {
           </Text>
 
           <Text style={styles.questionLabel}>Secret Question</Text>
+          <Pressable onPress={handleQuickFillQuestion} style={styles.quickFillButton}>
+            <MaterialIcons color={colors.primary} name="auto-awesome" size={14} />
+            <Text style={styles.quickFillButtonText}>Use AI suggested question</Text>
+          </Pressable>
+
           <TextInput
             multiline
             onChangeText={setQuestion}
@@ -85,16 +183,18 @@ export function ReportScreen() {
             value={question}
           />
 
-          <Pressable disabled={!canSubmit} style={styles.submitOuter}>
+          <Pressable disabled={!canSubmit || isSubmitting} onPress={handleSubmitReport} style={styles.submitOuter}>
             <LinearGradient
-              colors={canSubmit ? [colors.primary, colors.primaryContainer] : ['#A9AECE', '#959AB5']}
+              colors={canSubmit && !isSubmitting ? [colors.primary, colors.primaryContainer] : ['#A9AECE', '#959AB5']}
               end={{ x: 1, y: 1 }}
               start={{ x: 0, y: 0 }}
               style={styles.submitGradient}
             >
-              <Text style={styles.submitText}>Secure & Match Item</Text>
+              <Text style={styles.submitText}>{isSubmitting ? 'Submitting...' : 'Secure & Match Item'}</Text>
             </LinearGradient>
           </Pressable>
+
+          {statusMessage ? <Text style={styles.statusText}>{statusMessage}</Text> : null}
         </View>
       </ScrollView>
     </SafeAreaView>
@@ -247,6 +347,24 @@ const styles = StyleSheet.create({
     marginBottom: 8,
     textTransform: 'uppercase',
   },
+  quickFillButton: {
+    alignItems: 'center',
+    alignSelf: 'flex-start',
+    backgroundColor: '#E9EEFF',
+    borderColor: 'rgba(0, 6, 102, 0.14)',
+    borderRadius: radii.md,
+    borderWidth: 1,
+    flexDirection: 'row',
+    marginBottom: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 7,
+  },
+  quickFillButtonText: {
+    color: colors.primary,
+    fontFamily: fontFamily.bodySemiBold,
+    fontSize: 12,
+    marginLeft: 4,
+  },
   questionInput: {
     backgroundColor: colors.surfaceHighest,
     borderRadius: radii.lg,
@@ -271,5 +389,12 @@ const styles = StyleSheet.create({
     color: colors.onPrimary,
     fontFamily: fontFamily.headlineBold,
     fontSize: 17,
+  },
+  statusText: {
+    color: colors.success,
+    fontFamily: fontFamily.bodyMedium,
+    fontSize: 12,
+    lineHeight: 17,
+    marginTop: 10,
   },
 });
