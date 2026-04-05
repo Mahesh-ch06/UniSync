@@ -26,6 +26,7 @@ import { ActivityIndicator, StyleSheet, Text, View } from 'react-native';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 
 import { backendEnv, isBackendConfigured, missingEnvKeys } from './src/config/env';
+import { ErrorBoundary } from './src/components/ErrorBoundary';
 import { AuthScreen } from './src/screens/AuthScreen';
 import { HomeScreen } from './src/screens/HomeScreen';
 import { HistoryScreen } from './src/screens/HistoryScreen';
@@ -150,7 +151,11 @@ function SignedInGate() {
     return <CompleteNameScreen />;
   }
 
-  return <AppTabs />;
+  return (
+    <ErrorBoundary fallbackMessage="A screen encountered an error">
+      <AppTabs />
+    </ErrorBoundary>
+  );
 }
 
 export default function App() {
@@ -173,37 +178,43 @@ export default function App() {
   }
 
   if (!isBackendConfigured) {
-    return <SetupScreen missingKeys={missingEnvKeys} />;
+    return (
+      <SafeAreaProvider>
+        <SetupScreen missingKeys={missingEnvKeys} />
+      </SafeAreaProvider>
+    );
   }
 
   return (
-    <ClerkProvider
-      clerkJSVersion="5"
-      publishableKey={backendEnv.clerkPublishableKey}
-      tokenCache={tokenCache}
-    >
-      <SafeAreaProvider>
-        <NavigationContainer theme={navigationTheme}>
-          <StatusBar style="dark" />
+    <ErrorBoundary fallbackMessage="UniSync encountered an unexpected error">
+      <ClerkProvider
+        clerkJSVersion="5"
+        publishableKey={backendEnv.clerkPublishableKey}
+        tokenCache={tokenCache}
+      >
+        <SafeAreaProvider>
+          <NavigationContainer theme={navigationTheme}>
+            <StatusBar style="dark" />
 
-          <ClerkLoading>
-            <View style={styles.loaderWrap}>
-              <ActivityIndicator color={colors.primary} size="large" />
-              <Text style={styles.loaderText}>Preparing secure session...</Text>
-            </View>
-          </ClerkLoading>
+            <ClerkLoading>
+              <View style={styles.loaderWrap}>
+                <ActivityIndicator color={colors.primary} size="large" />
+                <Text style={styles.loaderText}>Preparing secure session...</Text>
+              </View>
+            </ClerkLoading>
 
-          <ClerkLoaded>
-            <SignedIn>
-              <SignedInGate />
-            </SignedIn>
-            <SignedOut>
-              <AuthScreen />
-            </SignedOut>
-          </ClerkLoaded>
-        </NavigationContainer>
-      </SafeAreaProvider>
-    </ClerkProvider>
+            <ClerkLoaded>
+              <SignedIn>
+                <SignedInGate />
+              </SignedIn>
+              <SignedOut>
+                <AuthScreen />
+              </SignedOut>
+            </ClerkLoaded>
+          </NavigationContainer>
+        </SafeAreaProvider>
+      </ClerkProvider>
+    </ErrorBoundary>
   );
 }
 
