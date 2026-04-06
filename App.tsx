@@ -28,6 +28,7 @@ import { SafeAreaProvider } from 'react-native-safe-area-context';
 
 import { backendEnv, isBackendConfigured, missingEnvKeys } from './src/config/env';
 import { ErrorBoundary } from './src/components/ErrorBoundary';
+import { OfflineExperienceModal } from './src/components/OfflineExperienceModal';
 import { NotificationBadgeProvider, useNotificationBadge } from './src/lib/notificationBadge';
 import { AuthScreen } from './src/screens/AuthScreen';
 import { HomeScreen } from './src/screens/HomeScreen';
@@ -287,6 +288,7 @@ export default function App() {
               </SignedOut>
             </ClerkLoaded>
           </NavigationContainer>
+          <OfflineExperienceModal />
         </SafeAreaProvider>
       </ClerkProvider>
     </ErrorBoundary>
