@@ -4,7 +4,7 @@
     "slug": "unisync",
     "owner": "mahesh06",
     "scheme": "unisync",
-    "version": "1.0.8",
+    "version": "1.0.9",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
@@ -15,7 +15,7 @@
     },
     "ios": {
       "supportsTablet": true,
-      "buildNumber": "1.0.8"
+      "buildNumber": "1.0.9"
     },
     "android": {
       "adaptiveIcon": {
@@ -24,8 +24,8 @@
       },
       "edgeToEdgeEnabled": true,
       "predictiveBackGestureEnabled": false,
-      "package": "com.mahesh0603.MobileApp",
-      "versionCode": 8,
+      "package": "com.mahesh0603.unisync",
+      "versionCode": 9,
       "permissions": [
         "android.permission.POST_NOTIFICATIONS",
         "android.permission.RECORD_AUDIO",
