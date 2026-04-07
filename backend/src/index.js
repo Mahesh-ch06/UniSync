@@ -26,6 +26,8 @@ const geminiModel = readText(process.env.GEMINI_MODEL) || 'gemini-1.5-flash';
 const PICKUP_EDIT_WINDOW_MS = 5 * 60 * 1000;
 const MESSAGE_TABLE_NAME = 'match_request_messages';
 const inMemoryMatchRequestMessages = new Map();
+const USER_PROFILE_SCHEMA_GUIDE =
+  'Run SQL migrations 020_create_user_profiles_and_summary.sql, 022_update_profile_summary_in_progress_and_last_activity.sql, 023_fix_user_profiles_rls_claim_mapping.sql, 024_user_profiles_rls_allow_clerk_session_role.sql, and 025_fix_user_profile_settings_schema_compat.sql.';
 
 if (!supabaseUrl || !serviceRoleKey) {
   throw new Error(
@@ -81,6 +83,80 @@ function readPositiveNumber(value) {
   }
 
   return 0;
+}
+
+function readNumber(value) {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value;
+  }
+
+  if (typeof value === 'string') {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed)) {
+      return parsed;
+    }
+  }
+
+  return 0;
+}
+
+function readBoolean(value, fallback) {
+  if (typeof value === 'boolean') {
+    return value;
+  }
+
+  if (typeof value === 'string') {
+    const normalized = value.trim().toLowerCase();
+    if (normalized === 'true') {
+      return true;
+    }
+
+    if (normalized === 'false') {
+      return false;
+    }
+  }
+
+  return fallback;
+}
+
+function isMissingSchemaError(error) {
+  const code = readText(error?.code).toUpperCase();
+  const message = readText(error?.message).toLowerCase();
+
+  if (['42P01', '42703', '42883', 'PGRST200', 'PGRST202', 'PGRST204'].includes(code)) {
+    return true;
+  }
+
+  return (
+    message.includes('does not exist') ||
+    message.includes('could not find') ||
+    message.includes('schema cache') ||
+    message.includes('undefined column')
+  );
+}
+
+function computeLevelFromPoints(totalPoints) {
+  if (totalPoints >= 1200) {
+    return 'Legend';
+  }
+
+  if (totalPoints >= 700) {
+    return 'Champion';
+  }
+
+  if (totalPoints >= 350) {
+    return 'Guardian';
+  }
+
+  if (totalPoints >= 150) {
+    return 'Tracker';
+  }
+
+  if (totalPoints >= 50) {
+    return 'Scout';
+  }
+
+  return 'Seed';
 }
 
 function clampNumber(value, min, max) {
@@ -947,6 +1023,319 @@ app.get('/api/points/me', requireClerkAuth, async (req, res) => {
   }
 });
 
+app.get('/api/profile/me', requireClerkAuth, async (req, res) => {
+  try {
+    const [profileResult, pointsResult, ledgerResult, foundResult, claimsResult] = await Promise.all([
+      supabase
+        .from('user_profiles')
+        .select('*')
+        .eq('user_id', req.auth.userId)
+        .maybeSingle(),
+      supabase
+        .from('user_points')
+        .select('total_points,level,updated_at')
+        .eq('user_id', req.auth.userId)
+        .maybeSingle(),
+      supabase
+        .from('points_ledger')
+        .select('id, points, reason, created_at')
+        .eq('user_id', req.auth.userId)
+        .order('created_at', { ascending: false })
+        .limit(8),
+      supabase
+        .from('found_items')
+        .select('created_at')
+        .eq('created_by', req.auth.userId),
+      supabase
+        .from('match_requests')
+        .select('status,created_at,reviewed_at,pickup_confirmed_at')
+        .eq('claimant_user_id', req.auth.userId),
+    ]);
+
+    const knownErrors = [
+      profileResult.error,
+      pointsResult.error,
+      ledgerResult.error,
+      foundResult.error,
+      claimsResult.error,
+    ].filter(Boolean);
+
+    const fatalError = knownErrors.find((error) => !isMissingSchemaError(error));
+    if (fatalError) {
+      throw fatalError;
+    }
+
+    const profile = profileResult.error ? null : profileResult.data ?? null;
+    const pointsRow = pointsResult.error ? null : pointsResult.data ?? null;
+    const ledgerRows = !ledgerResult.error && Array.isArray(ledgerResult.data) ? ledgerResult.data : [];
+    const foundRows = !foundResult.error && Array.isArray(foundResult.data) ? foundResult.data : [];
+    const claimRows = !claimsResult.error && Array.isArray(claimsResult.data) ? claimsResult.data : [];
+
+    const pointsFromTable = Math.max(0, Math.round(readNumber(pointsRow?.total_points)));
+    const pointsFromLedger = ledgerRows.reduce((sum, row) => sum + Math.round(readNumber(row.points)), 0);
+    const totalPoints = pointsFromTable > 0 ? pointsFromTable : Math.max(0, pointsFromLedger);
+
+    const claimsSubmitted = claimRows.length;
+    const claimsInProgress = claimRows.filter((row) => {
+      const status = readText(row.status);
+      return status === 'submitted' || status === 'approved';
+    }).length;
+    const claimsApproved = claimRows.filter((row) => readText(row.status) === 'approved').length;
+    const claimsPickedUp = claimRows.filter((row) => readText(row.status) === 'picked_up').length;
+
+    const timestamps = [];
+    const pointsUpdatedAt = readText(pointsRow?.updated_at);
+    if (pointsUpdatedAt) {
+      timestamps.push(pointsUpdatedAt);
+    }
+
+    ledgerRows.forEach((row) => {
+      const createdAt = readText(row.created_at);
+      if (createdAt) {
+        timestamps.push(createdAt);
+      }
+    });
+
+    foundRows.forEach((row) => {
+      const createdAt = readText(row.created_at);
+      if (createdAt) {
+        timestamps.push(createdAt);
+      }
+    });
+
+    claimRows.forEach((row) => {
+      const createdAt = readText(row.created_at);
+      const reviewedAt = readText(row.reviewed_at);
+      const pickupAt = readText(row.pickup_confirmed_at);
+
+      if (createdAt) {
+        timestamps.push(createdAt);
+      }
+
+      if (reviewedAt) {
+        timestamps.push(reviewedAt);
+      }
+
+      if (pickupAt) {
+        timestamps.push(pickupAt);
+      }
+    });
+
+    let lastActivityAt = null;
+    let latestTimestamp = 0;
+    timestamps.forEach((value) => {
+      const timestamp = new Date(value).getTime();
+      if (!Number.isNaN(timestamp) && timestamp >= latestTimestamp) {
+        latestTimestamp = timestamp;
+        lastActivityAt = value;
+      }
+    });
+
+    res.json({
+      profile,
+      stats: {
+        totalPoints,
+        level: readText(pointsRow?.level) || computeLevelFromPoints(totalPoints),
+        itemsReported: foundRows.length,
+        claimsSubmitted,
+        claimsInProgress,
+        claimsApproved,
+        claimsPickedUp,
+      },
+      activity: ledgerRows,
+      lastActivityAt,
+    });
+  } catch (error) {
+    res.status(500).json({
+      error: 'Failed to fetch profile.',
+      details: error && typeof error === 'object' && 'message' in error ? error.message : null,
+    });
+  }
+});
+
+app.put('/api/profile/me', requireClerkAuth, async (req, res) => {
+  const body = req.body || {};
+  const displayName = readText(body.display_name);
+
+  if (displayName.length < 2) {
+    res.status(400).json({ error: 'display_name must be at least 2 characters.' });
+    return;
+  }
+
+  const yearInput = readText(body.year_of_study);
+  let yearOfStudy = null;
+
+  if (yearInput) {
+    const parsed = Number(yearInput);
+    const rounded = Math.round(parsed);
+    if (!Number.isFinite(parsed) || String(rounded) !== yearInput || rounded < 1 || rounded > 8) {
+      res.status(400).json({ error: 'year_of_study must be an integer between 1 and 8.' });
+      return;
+    }
+    yearOfStudy = rounded;
+  }
+
+  try {
+    const payload = {
+      user_id: req.auth.userId,
+      display_name: displayName,
+      campus_name: readText(body.campus_name) || null,
+      department: readText(body.department) || null,
+      year_of_study: yearOfStudy,
+      phone: readText(body.phone) || null,
+      bio: readText(body.bio) || null,
+      avatar_url: readText(body.avatar_url) || null,
+      notify_claim_updates: readBoolean(body.notify_claim_updates, true),
+      notify_messages: readBoolean(body.notify_messages, true),
+      public_profile: readBoolean(body.public_profile, false),
+    };
+
+    const { data, error } = await supabase
+      .from('user_profiles')
+      .upsert(payload, { onConflict: 'user_id' })
+      .select('*')
+      .maybeSingle();
+
+    if (error) {
+      if (isMissingSchemaError(error)) {
+        res.status(500).json({
+          error: `Profile schema is out of date. ${USER_PROFILE_SCHEMA_GUIDE}`,
+        });
+        return;
+      }
+
+      throw error;
+    }
+
+    res.json({ profile: data ?? payload });
+  } catch (error) {
+    res.status(500).json({
+      error: 'Failed to save profile.',
+      details: error && typeof error === 'object' && 'message' in error ? error.message : null,
+    });
+  }
+});
+
+app.post('/api/profile/avatar', requireClerkAuth, async (req, res) => {
+  const body = req.body || {};
+  const imageBase64 = readText(body.image_base64);
+
+  if (!imageBase64) {
+    res.status(400).json({ error: 'image_base64 is required.' });
+    return;
+  }
+
+  try {
+    const uploaded = await uploadBase64Image({
+      imageBase64,
+      mimeType: normalizeMimeType(body.mime_type),
+      folder: 'profile-avatars',
+      userId: req.auth.userId,
+    });
+
+    const { error } = await supabase
+      .from('user_profiles')
+      .upsert(
+        {
+          user_id: req.auth.userId,
+          avatar_url: uploaded.imageUrl,
+        },
+        { onConflict: 'user_id' },
+      );
+
+    if (error && !isMissingSchemaError(error)) {
+      throw error;
+    }
+
+    res.status(201).json({
+      avatarUrl: uploaded.imageUrl,
+      objectPath: uploaded.objectPath,
+    });
+  } catch (error) {
+    res.status(500).json({
+      error: 'Failed to upload profile avatar.',
+      details: error && typeof error === 'object' && 'message' in error ? error.message : null,
+    });
+  }
+});
+
+app.get('/api/settings/me', requireClerkAuth, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('user_profiles')
+      .select('*')
+      .eq('user_id', req.auth.userId)
+      .maybeSingle();
+
+    if (error) {
+      if (isMissingSchemaError(error)) {
+        res.json({
+          settings: {
+            notifyClaimUpdates: true,
+            notifyMessages: true,
+            publicProfile: true,
+          },
+        });
+        return;
+      }
+
+      throw error;
+    }
+
+    res.json({
+      settings: {
+        notifyClaimUpdates: readBoolean(data?.notify_claim_updates, true),
+        notifyMessages: readBoolean(data?.notify_messages, true),
+        publicProfile: readBoolean(data?.public_profile, true),
+      },
+    });
+  } catch (error) {
+    res.status(500).json({
+      error: 'Failed to fetch settings.',
+      details: error && typeof error === 'object' && 'message' in error ? error.message : null,
+    });
+  }
+});
+
+app.put('/api/settings/me', requireClerkAuth, async (req, res) => {
+  const body = req.body || {};
+
+  try {
+    const payload = {
+      user_id: req.auth.userId,
+      notify_claim_updates: readBoolean(body.notify_claim_updates, true),
+      notify_messages: readBoolean(body.notify_messages, true),
+      public_profile: readBoolean(body.public_profile, true),
+    };
+
+    const { error } = await supabase.from('user_profiles').upsert(payload, { onConflict: 'user_id' });
+
+    if (error) {
+      if (isMissingSchemaError(error)) {
+        res.status(500).json({
+          error: `Profile schema is out of date. ${USER_PROFILE_SCHEMA_GUIDE}`,
+        });
+        return;
+      }
+
+      throw error;
+    }
+
+    res.json({
+      settings: {
+        notifyClaimUpdates: payload.notify_claim_updates,
+        notifyMessages: payload.notify_messages,
+        publicProfile: payload.public_profile,
+      },
+    });
+  } catch (error) {
+    res.status(500).json({
+      error: 'Failed to save settings.',
+      details: error && typeof error === 'object' && 'message' in error ? error.message : null,
+    });
+  }
+});
+
 app.post('/api/vision/classify-item', requireClerkAuth, async (req, res) => {
   const body = req.body || {};
   const imageBase64 = readText(body.image_base64);
@@ -1029,7 +1418,11 @@ app.post('/api/match-requests/auto', requireClerkAuth, async (req, res) => {
 
     let lostItemId = readText(body.lost_item_id);
 
-    if (!lostItemId) {
+    const createLostItemIfMissing = async () => {
+      if (lostItemId) {
+        return lostItemId;
+      }
+
       const { data: createdLost, error: lostInsertError } = await supabase
         .from('lost_items')
         .insert({
@@ -1058,12 +1451,16 @@ app.post('/api/match-requests/auto', requireClerkAuth, async (req, res) => {
         referenceType: 'lost_item',
         referenceId: lostItemId,
       });
-    }
+
+      return lostItemId;
+    };
 
     const rawFoundItems = await loadPublicFoundItems(120);
     const claimableFoundItems = rawFoundItems;
 
     if (!claimableFoundItems.length) {
+      await createLostItemIfMissing();
+
       res.status(200).json({
         matched: false,
         reason: 'No found items available to match against yet.',
@@ -1089,6 +1486,8 @@ app.post('/api/match-requests/auto', requireClerkAuth, async (req, res) => {
     const best = scored[0];
 
     if (!best || best.score < 45) {
+      await createLostItemIfMissing();
+
       res.status(200).json({
         matched: false,
         reason: 'No strong match yet. We saved your loss report and proof image.',
@@ -1105,6 +1504,28 @@ app.post('/api/match-requests/auto', requireClerkAuth, async (req, res) => {
       });
       return;
     }
+
+    const { data: existingSubmitted, error: existingError } = await supabase
+      .from('match_requests')
+      .select('id')
+      .eq('found_item_id', best.candidate.id)
+      .eq('claimant_user_id', req.auth.userId)
+      .eq('status', 'submitted')
+      .limit(1);
+
+    if (existingError) {
+      throw existingError;
+    }
+
+    if (existingSubmitted && existingSubmitted.length) {
+      res.status(409).json({
+        error: 'This item is already submitted.',
+        existingRequestId: existingSubmitted[0].id,
+      });
+      return;
+    }
+
+    await createLostItemIfMissing();
 
     const { data: requestRow, error: requestError } = await supabase
       .from('match_requests')

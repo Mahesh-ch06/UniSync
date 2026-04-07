@@ -19,7 +19,7 @@ import {
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { AppTopBar } from '../components/AppTopBar';
-import { buildSupabaseClient } from '../lib/supabase';
+import { backendEnv } from '../config/env';
 import { colors, fontFamily, radii, shadows } from '../theme/tokens';
 
 type ProfileFormState = {
@@ -348,36 +348,21 @@ function resolveImageExtension(uri: string, mimeType?: string | null): string {
 async function resolveSupabaseAccessToken(
   getTokenFn: ReturnType<typeof useAuth>['getToken'],
 ): Promise<string | null> {
-  const readToken = async () => {
-    const templateToken = await getTokenFn({ template: 'supabase' }).catch(() => null);
-    const normalizedTemplateToken = readText(templateToken);
-
-    if (normalizedTemplateToken) {
-      return normalizedTemplateToken;
-    }
-
-    const sessionToken = await getTokenFn().catch(() => null);
-    const normalizedSessionToken = readText(sessionToken);
-
-    return normalizedSessionToken || null;
-  };
-
-  const firstAttempt = await readToken();
-  if (firstAttempt) {
-    return firstAttempt;
+  const firstAttempt = await getTokenFn().catch(() => null);
+  const normalizedFirstAttempt = readText(firstAttempt);
+  if (normalizedFirstAttempt) {
+    return normalizedFirstAttempt;
   }
 
   // Clerk tokens can be briefly unavailable right after session restore.
   await new Promise((resolve) => setTimeout(resolve, 350));
-  return await readToken();
+  const secondAttempt = await getTokenFn().catch(() => null);
+  const normalizedSecondAttempt = readText(secondAttempt);
+  return normalizedSecondAttempt || null;
 }
 
 function tokenMissingMessage(): string {
-  return 'Authentication token missing. Sign out/in and configure Clerk JWT template "supabase" if needed.';
-}
-
-function tokenKeyMismatchMessage(): string {
-  return 'Authentication token type is not accepted by Supabase. Configure Clerk JWT template "supabase" and signing key settings.';
+  return 'Authentication token missing. Sign out and sign in again.';
 }
 
 function profileSignature(form: ProfileFormState): string {
@@ -406,11 +391,61 @@ function normalizeProfileErrorMessage(error: unknown, fallbackMessage: string): 
 
   const normalized = readText(message).toLowerCase();
 
-  if (normalized.includes('no suitable key') || normalized.includes('wrong key type')) {
-    return tokenKeyMismatchMessage();
+  if (
+    normalized.includes('failed to fetch') ||
+    normalized.includes('network request failed') ||
+    normalized.includes('network issue')
+  ) {
+    return 'Network issue while syncing profile. Check your internet and retry.';
   }
 
   return message || fallbackMessage;
+}
+
+async function fetchWithTimeout(
+  url: string,
+  init: RequestInit,
+  timeoutMs: number,
+  timeoutMessage: string,
+): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    return await fetch(url, {
+      ...init,
+      signal: controller.signal,
+    });
+  } catch (error) {
+    const aborted = error instanceof Error && error.name === 'AbortError';
+    if (aborted) {
+      throw new Error(timeoutMessage);
+    }
+
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function readResponseError(response: Response, fallbackMessage: string): Promise<string> {
+  if (response.status === 404) {
+    return 'Backend profile route is not available. Deploy the latest backend and retry.';
+  }
+
+  try {
+    const payload = (await response.json()) as { error?: unknown; details?: unknown };
+    const errorMessage = readText(payload.error);
+    const detailsMessage = readText(payload.details);
+
+    if (errorMessage && detailsMessage) {
+      return `${errorMessage} (${detailsMessage})`;
+    }
+
+    return errorMessage || detailsMessage || fallbackMessage;
+  } catch {
+    return fallbackMessage;
+  }
 }
 
 function buildDefaultProfile(user: ReturnType<typeof useUser>['user']): ProfileFormState {
@@ -601,6 +636,7 @@ export function ProfileScreen() {
   }, [getToken]);
 
   const userPrimaryEmail = readText(user?.primaryEmailAddress?.emailAddress);
+  const backendBaseUrl = useMemo(() => backendEnv.backendUrl.replace(/\/+$/, ''), []);
 
   const defaultProfile = useMemo(
     () => buildDefaultProfile(user),
@@ -633,6 +669,39 @@ export function ProfileScreen() {
     setForm(defaultProfileRef.current);
   }, [userId]);
 
+  const authedProfileRequest = useCallback(
+    async (path: string, init: RequestInit, timeoutMessage: string) => {
+      if (!backendBaseUrl) {
+        throw new Error('Backend is not configured. Set EXPO_PUBLIC_BACKEND_URL.');
+      }
+
+      const accessToken = await withTimeout(
+        resolveSupabaseAccessToken(getTokenRef.current),
+        PROFILE_LOAD_TIMEOUT_MS,
+        timeoutMessage,
+      );
+
+      if (!accessToken) {
+        throw new Error(tokenMissingMessage());
+      }
+
+      return await fetchWithTimeout(
+        `${backendBaseUrl}${path}`,
+        {
+          ...init,
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${accessToken}`,
+            ...(init.headers ?? {}),
+          },
+        },
+        PROFILE_LOAD_TIMEOUT_MS,
+        timeoutMessage,
+      );
+    },
+    [backendBaseUrl],
+  );
+
   const loadProfileData = useCallback(
     async (options?: LoadProfileOptions) => {
       const isSoft = options?.soft ?? false;
@@ -664,147 +733,122 @@ export function ProfileScreen() {
         const timeoutMessage =
           'Profile loading timed out. Check your internet connection and pull to refresh.';
 
-        const accessToken = await withTimeout(
-          resolveSupabaseAccessToken(getTokenRef.current),
-          PROFILE_LOAD_TIMEOUT_MS,
+        const response = await authedProfileRequest(
+          '/api/profile/me',
+          {
+            method: 'GET',
+          },
           timeoutMessage,
         );
 
-        if (!accessToken) {
-          setErrorMessage(tokenMissingMessage());
-          setStats(DEFAULT_STATS);
-          setActivityItems([]);
-          setLastActivityAt(null);
-          setSyncStatus('error');
-          return;
-        }
+        if (response.status === 404) {
+          let legacyPointsPayload: {
+            totalPoints?: unknown;
+            level?: unknown;
+            recentActivity?: PointsLedgerRow[];
+          } | null = null;
 
-        const client = buildSupabaseClient(accessToken ?? undefined);
+          try {
+            const legacyPointsResponse = await authedProfileRequest(
+              '/api/points/me',
+              {
+                method: 'GET',
+              },
+              timeoutMessage,
+            );
 
-        if (!client) {
-          setErrorMessage(
-            'Supabase is not configured. Add EXPO_PUBLIC_SUPABASE_URL and EXPO_PUBLIC_SUPABASE_ANON_KEY.',
-          );
-          setStats(DEFAULT_STATS);
-          setActivityItems([]);
-          setLastActivityAt(null);
-          return;
-        }
+            if (legacyPointsResponse.ok) {
+              legacyPointsPayload = (await legacyPointsResponse.json()) as {
+                totalPoints?: unknown;
+                level?: unknown;
+                recentActivity?: PointsLedgerRow[];
+              };
+            }
+          } catch {
+            // Keep fallback defaults if legacy points route is unavailable.
+          }
 
-        const [profileResult, summaryResult, ledgerResult, pointsDirectResult] = await withTimeout(
-          Promise.all([
-            client
-              .from('user_profiles')
-              .select(
-                'display_name,campus_name,department,year_of_study,phone,bio,avatar_url,notify_claim_updates,notify_messages,public_profile',
-              )
-              .eq('user_id', userId)
-              .maybeSingle(),
-            client.rpc('get_my_profile_summary'),
-            client
-              .from('points_ledger')
-              .select('id,points,reason,created_at')
-              .eq('user_id', userId)
-              .order('created_at', { ascending: false })
-              .limit(8),
-            client
-              .from('user_points')
-              .select('total_points,level,updated_at')
-              .eq('user_id', userId)
-              .maybeSingle(),
-          ]),
-          PROFILE_LOAD_TIMEOUT_MS,
-          timeoutMessage,
-        );
-
-        if (profileResult.error && !isMissingSchemaError(profileResult.error)) {
-          throw profileResult.error;
-        }
-
-        if (profileResult.error && isMissingSchemaError(profileResult.error)) {
           const fallbackForm = defaultProfileRef.current;
           setForm(fallbackForm);
           lastSavedSignatureRef.current = profileSignature(fallbackForm);
-          setSyncStatus('synced');
-          setErrorMessage(
-            'Profile table is missing. Run SQL migration 020_create_user_profiles_and_summary.sql.',
-          );
-        } else {
-          const mergedForm = mergeProfileData(
-            defaultProfileRef.current,
-            (profileResult.data as ProfileRow | null) ?? null,
-          );
-          setForm(mergedForm);
-          lastSavedSignatureRef.current = profileSignature(mergedForm);
-          setSyncStatus('synced');
-        }
 
-        if (ledgerResult.error && !isMissingSchemaError(ledgerResult.error)) {
-          throw ledgerResult.error;
-        }
-
-        const ledgerRows =
-          !ledgerResult.error && Array.isArray(ledgerResult.data)
-            ? (ledgerResult.data as PointsLedgerRow[])
+          const legacyRows = Array.isArray(legacyPointsPayload?.recentActivity)
+            ? legacyPointsPayload.recentActivity
             : [];
 
-        if (ledgerResult.error && isMissingSchemaError(ledgerResult.error)) {
-          setActivityItems([]);
-        } else {
+          setStats({
+            ...DEFAULT_STATS,
+            totalPoints: Math.max(0, Math.round(readNumber(legacyPointsPayload?.totalPoints))),
+            level: readText(legacyPointsPayload?.level) || 'Seed',
+          });
+
           setActivityItems(
-            ledgerRows.map((row, index) => ({
-              id: readIdentifier(row.id, `activity-${index}`),
+            legacyRows.map((row, index) => ({
+              id: readIdentifier(row.id, `legacy-activity-${index}`),
               points: Math.round(readNumber(row.points)),
               reason: toTitleCase(readText(row.reason) || 'Activity'),
               createdAt: readText(row.created_at) || null,
             })),
           );
+
+          setLastActivityAt(readText(legacyRows[0]?.created_at) || null);
+          setErrorMessage('');
+          setSuccessMessage('Using compatibility profile mode. Deploy latest backend for full profile sync.');
+          setSyncStatus('synced');
+          return;
         }
 
-        if (summaryResult.error && !isMissingSchemaError(summaryResult.error)) {
-          throw summaryResult.error;
+        if (!response.ok) {
+          throw new Error(await readResponseError(response, 'Failed to load profile data.'));
         }
 
-        if (pointsDirectResult.error && !isMissingSchemaError(pointsDirectResult.error)) {
-          throw pointsDirectResult.error;
-        }
-
-        const payload = Array.isArray(summaryResult.data)
-          ? ((summaryResult.data[0] ?? null) as ProfileSummaryRow | null)
-          : ((summaryResult.data ?? null) as ProfileSummaryRow | null);
-
-        const rpcStats = parseSummaryStats(payload);
-        const directPoints = Math.max(
-          0,
-          Math.round(readNumber((pointsDirectResult.data as PointsStatsRow | null)?.total_points)),
-        );
-        const directLevel = readText((pointsDirectResult.data as PointsStatsRow | null)?.level);
-        const mergedStats: ProfileStats = {
-          ...rpcStats,
-          totalPoints: Math.max(rpcStats.totalPoints, directPoints),
-          level: directPoints > rpcStats.totalPoints && directLevel ? directLevel : rpcStats.level,
+        const payload = (await response.json()) as {
+          profile?: unknown;
+          stats?: {
+            totalPoints?: unknown;
+            level?: unknown;
+            itemsReported?: unknown;
+            claimsSubmitted?: unknown;
+            claimsInProgress?: unknown;
+            claimsApproved?: unknown;
+            claimsPickedUp?: unknown;
+          };
+          activity?: PointsLedgerRow[];
+          lastActivityAt?: unknown;
         };
 
-        const hasRpcInProgressField =
-          payload !== null && Object.prototype.hasOwnProperty.call(payload, 'claims_in_progress');
-        const shouldUseFallbackStats =
-          (summaryResult.error && isMissingSchemaError(summaryResult.error)) ||
-          payload === null ||
-          !hasRpcInProgressField ||
-          mergedStats.totalPoints === 0;
+        const profileRow =
+          payload.profile && typeof payload.profile === 'object'
+            ? (payload.profile as ProfileRow)
+            : null;
 
-        if (shouldUseFallbackStats) {
-          const fallback = await withTimeout(
-            loadStatsFallback(client, userId),
-            PROFILE_LOAD_TIMEOUT_MS,
-            timeoutMessage,
-          );
-          setStats(fallback.stats);
-          setLastActivityAt(fallback.lastActivityAt);
-        } else {
-          setStats(mergedStats);
-          setLastActivityAt(readText(payload?.last_activity_at) || null);
-        }
+        const mergedForm = mergeProfileData(defaultProfileRef.current, profileRow);
+        setForm(mergedForm);
+        lastSavedSignatureRef.current = profileSignature(mergedForm);
+        setSyncStatus('synced');
+
+        const statsPayload = payload.stats;
+        setStats({
+          totalPoints: Math.max(0, Math.round(readNumber(statsPayload?.totalPoints))),
+          level: readText(statsPayload?.level) || 'Seed',
+          itemsReported: Math.max(0, Math.round(readNumber(statsPayload?.itemsReported))),
+          claimsSubmitted: Math.max(0, Math.round(readNumber(statsPayload?.claimsSubmitted))),
+          claimsInProgress: Math.max(0, Math.round(readNumber(statsPayload?.claimsInProgress))),
+          claimsApproved: Math.max(0, Math.round(readNumber(statsPayload?.claimsApproved))),
+          claimsPickedUp: Math.max(0, Math.round(readNumber(statsPayload?.claimsPickedUp))),
+        });
+
+        const ledgerRows = Array.isArray(payload.activity) ? payload.activity : [];
+        setActivityItems(
+          ledgerRows.map((row, index) => ({
+            id: readIdentifier(row.id, `activity-${index}`),
+            points: Math.round(readNumber(row.points)),
+            reason: toTitleCase(readText(row.reason) || 'Activity'),
+            createdAt: readText(row.created_at) || null,
+          })),
+        );
+
+        setLastActivityAt(readText(payload.lastActivityAt) || null);
       } catch (error) {
         const message = normalizeProfileErrorMessage(error, 'Failed to load profile data.');
 
@@ -816,7 +860,7 @@ export function ProfileScreen() {
         }
       }
     },
-    [isAuthLoaded, userId],
+      [authedProfileRequest, isAuthLoaded, userId],
   );
 
   useEffect(() => {
@@ -874,6 +918,7 @@ export function ProfileScreen() {
         mediaTypes: ImagePicker.MediaTypeOptions.Images,
         allowsEditing: true,
         aspect: [1, 1],
+        base64: true,
         quality: 0.8,
       });
 
@@ -882,47 +927,31 @@ export function ProfileScreen() {
       }
 
       const selectedAsset = pickedImage.assets[0];
-      const assetUri = readText(selectedAsset.uri);
+      const encodedImage = readText(selectedAsset.base64);
 
-      if (!assetUri) {
-        setErrorMessage('Could not read the selected image.');
+      if (!encodedImage) {
+        setErrorMessage('Could not encode the selected image. Try a different photo.');
         return;
       }
 
-      const accessToken = await withTimeout(
-        resolveSupabaseAccessToken(getTokenRef.current),
-        PROFILE_LOAD_TIMEOUT_MS,
+      const response = await authedProfileRequest(
+        '/api/profile/avatar',
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            image_base64: encodedImage,
+            mime_type: selectedAsset.mimeType || 'image/jpeg',
+          }),
+        },
         'Avatar upload timed out. Try again.',
       );
 
-      if (!accessToken) {
-        setErrorMessage(tokenMissingMessage());
-        return;
+      if (!response.ok) {
+        throw new Error(await readResponseError(response, 'Could not upload profile image.'));
       }
 
-      const client = buildSupabaseClient(accessToken ?? undefined);
-
-      if (!client) {
-        setErrorMessage('Supabase is not configured. Unable to upload image.');
-        return;
-      }
-
-      const uploadResponse = await fetch(assetUri);
-      const uploadBlob = await uploadResponse.blob();
-      const extension = resolveImageExtension(assetUri, selectedAsset.mimeType);
-      const storagePath = `profile-avatars/${userId}/avatar-${Date.now()}.${extension}`;
-
-      const { error: uploadError } = await client.storage.from('campus-items').upload(storagePath, uploadBlob, {
-        upsert: true,
-        contentType: selectedAsset.mimeType || `image/${extension}`,
-      });
-
-      if (uploadError) {
-        throw uploadError;
-      }
-
-      const { data } = client.storage.from('campus-items').getPublicUrl(storagePath);
-      const publicAvatarUrl = readText(data.publicUrl);
+      const payload = (await response.json()) as { avatarUrl?: unknown };
+      const publicAvatarUrl = readText(payload.avatarUrl);
 
       if (!publicAvatarUrl) {
         setErrorMessage('Image uploaded, but failed to create public URL.');
@@ -934,7 +963,7 @@ export function ProfileScreen() {
         avatarUrl: publicAvatarUrl,
       }));
       setSyncStatus('idle');
-      setSuccessMessage('Profile photo uploaded. Saving your update automatically.');
+      setSuccessMessage('Profile photo uploaded. Tap Save Profile to keep this change.');
     } catch (error) {
       const message = normalizeProfileErrorMessage(error, 'Could not upload profile image.');
 
@@ -943,7 +972,7 @@ export function ProfileScreen() {
     } finally {
       setIsUploadingAvatar(false);
     }
-  }, [isAuthLoaded, isLoading, isSaving, isUploadingAvatar, userId]);
+  }, [authedProfileRequest, isAuthLoaded, isLoading, isSaving, isUploadingAvatar, userId]);
 
   const handleRemoveAvatar = useCallback(() => {
     if (isUploadingAvatar || isSaving || isLoading) {
@@ -955,7 +984,7 @@ export function ProfileScreen() {
       avatarUrl: '',
     }));
     setSyncStatus('idle');
-    setSuccessMessage('Profile photo removed. Saving your update automatically.');
+    setSuccessMessage('Profile photo removed. Tap Save Profile to keep this change.');
   }, [isLoading, isSaving, isUploadingAvatar]);
 
   const handleSaveProfile = useCallback(async (options?: SaveProfileOptions) => {
@@ -1003,26 +1032,11 @@ export function ProfileScreen() {
     }
 
     try {
-      const accessToken = await resolveSupabaseAccessToken(getTokenRef.current);
-
-      if (!accessToken) {
-        setErrorMessage(tokenMissingMessage());
-        return;
-      }
-
-      const client = buildSupabaseClient(accessToken ?? undefined);
-
-      if (!client) {
-        setErrorMessage('Supabase is not configured. Unable to save profile.');
-        return;
-      }
-
       const payload = {
-        user_id: userId,
         display_name: normalizedName,
         campus_name: readText(form.campusName) || null,
         department: readText(form.department) || null,
-        year_of_study: normalizedYear,
+        year_of_study: normalizedYear !== null ? String(normalizedYear) : '',
         phone: readText(form.phone) || null,
         bio: readText(form.bio) || null,
         avatar_url: readText(form.avatarUrl) || null,
@@ -1031,26 +1045,28 @@ export function ProfileScreen() {
         public_profile: form.publicProfile,
       };
 
-      const { error } = await client.from('user_profiles').upsert(payload, { onConflict: 'user_id' });
+      const response = await authedProfileRequest(
+        '/api/profile/me',
+        {
+          method: 'PUT',
+          body: JSON.stringify(payload),
+        },
+        'Profile save timed out. Try again.',
+      );
 
-      if (error) {
-        if (isMissingSchemaError(error)) {
-          setErrorMessage(
-            'Profile table is missing. Run SQL migration 020_create_user_profiles_and_summary.sql.',
-          );
-          setSyncStatus('error');
-          return;
+      if (response.status === 404) {
+        lastSavedSignatureRef.current = currentSignature;
+        setSyncStatus('idle');
+
+        if (!silent) {
+          setSuccessMessage('Saved locally. Deploy latest backend to enable server profile sync.');
         }
 
-        if (isRlsPolicyError(error)) {
-          setErrorMessage(
-            'Permission denied for profile save. Run SQL migration 024_user_profiles_rls_allow_clerk_session_role.sql.',
-          );
-          setSyncStatus('error');
-          return;
-        }
+        return;
+      }
 
-        throw error;
+      if (!response.ok) {
+        throw new Error(await readResponseError(response, 'Could not save profile right now.'));
       }
 
       lastSavedSignatureRef.current = currentSignature;
@@ -1075,7 +1091,7 @@ export function ProfileScreen() {
     } finally {
       setIsSaving(false);
     }
-  }, [form, isAuthLoaded, isSaving, isUploadingAvatar, loadProfileData, userId]);
+  }, [authedProfileRequest, form, isAuthLoaded, isSaving, isUploadingAvatar, loadProfileData, userId]);
 
   const handleDiscardProfileChanges = useCallback(async () => {
     if (isSaving || isUploadingAvatar || isLoading) {
@@ -1093,38 +1109,6 @@ export function ProfileScreen() {
       setSyncStatus('error');
     }
   }, [isLoading, isSaving, isUploadingAvatar, loadProfileData]);
-
-  useEffect(() => {
-    if (!isAuthLoaded || isLoading || isSaving || isUploadingAvatar || !userId) {
-      return;
-    }
-
-    const normalizedName = form.displayName.trim();
-    if (normalizedName.length < 2) {
-      return;
-    }
-
-    const yearInput = form.yearOfStudy.trim();
-    if (yearInput) {
-      const parsed = Number(yearInput);
-      const rounded = Math.round(parsed);
-
-      if (!Number.isFinite(parsed) || String(rounded) !== yearInput || rounded < 1 || rounded > 8) {
-        return;
-      }
-    }
-
-    const currentSignature = profileSignature(form);
-    if (currentSignature === lastSavedSignatureRef.current) {
-      return;
-    }
-
-    const timer = setTimeout(() => {
-      void handleSaveProfile({ refresh: false, silent: true });
-    }, 900);
-
-    return () => clearTimeout(timer);
-  }, [form, handleSaveProfile, isAuthLoaded, isLoading, isSaving, isUploadingAvatar, userId]);
 
   const handleSignOut = async () => {
     if (isSigningOut) {
@@ -1227,7 +1211,7 @@ export function ProfileScreen() {
 
     return {
       icon: 'edit' as keyof typeof MaterialIcons.glyphMap,
-      label: 'Editing in real time',
+      label: 'Manual save mode',
       color: colors.onSurfaceVariant,
     };
   }, [syncStatus]);
@@ -1356,7 +1340,7 @@ export function ProfileScreen() {
           <>
             <View style={styles.sectionHeaderRow}>
               <Text style={styles.sectionTitle}>Edit Profile</Text>
-              <Text style={styles.sectionCaption}>Live autosave enabled</Text>
+              <Text style={styles.sectionCaption}>Manual save only</Text>
             </View>
 
             <View style={styles.formCard}>

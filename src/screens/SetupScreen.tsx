@@ -23,7 +23,11 @@ export function SetupScreen({ missingKeys }: SetupScreenProps) {
 
         <View style={styles.keysCard}>
           {React.Children.toArray(
-            missingKeys.map((keyName) => <Text style={styles.keyLine}>{keyName}</Text>),
+            missingKeys.map((keyName, index) => (
+              <Text key={`${keyName}-${index}`} style={styles.keyLine}>
+                {keyName}
+              </Text>
+            )),
           )}
         </View>
       </View>

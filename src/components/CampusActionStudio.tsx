@@ -110,6 +110,8 @@ type ClaimMessage = {
 };
 
 type HistoryFilter = 'all' | 'active' | 'completed';
+type HistorySortMode = 'latest' | 'match' | 'action';
+type HistoryQuickView = 'all' | 'needs-action' | 'active' | 'completed';
 type StudioLayout = 'full' | 'quick' | 'history';
 
 type PointsActivity = {
@@ -135,6 +137,7 @@ type CampusActionStudioProps = {
   focusClaimRequestId?: string;
   focusClaimNonce?: number;
   autoOpenFocusedClaimMessages?: boolean;
+  historyQuickView?: HistoryQuickView;
 };
 
 const LEVEL_STEPS = [
@@ -279,6 +282,37 @@ function minutesLeft(seconds: number): number {
   }
 
   return Math.ceil(seconds / 60);
+}
+
+function toTimestampMs(iso: string | null): number {
+  if (!iso) {
+    return 0;
+  }
+
+  const timestamp = new Date(iso).getTime();
+  return Number.isFinite(timestamp) ? timestamp : 0;
+}
+
+function isHistoryEntryActionNeeded(entry: IncomingClaim, userId: string): boolean {
+  const ownerId = safeString(entry.found_item.created_by);
+  const claimantId = safeString(entry.claimant_user_id);
+
+  const isOwner = Boolean(userId) && ownerId === userId;
+  const isClaimant = Boolean(userId) && claimantId === userId;
+  const canUndoPickup =
+    isOwner &&
+    entry.status === 'picked_up' &&
+    (entry.pickup_is_editable || entry.pickup_edit_seconds_remaining > 0);
+
+  if (isOwner && (entry.status === 'submitted' || entry.status === 'approved' || canUndoPickup)) {
+    return true;
+  }
+
+  if (isClaimant && entry.status === 'approved') {
+    return true;
+  }
+
+  return false;
 }
 
 function normalizeScanDetection(value: unknown): ScanDetection {
@@ -435,6 +469,7 @@ export function CampusActionStudio({
   focusClaimRequestId,
   focusClaimNonce = 0,
   autoOpenFocusedClaimMessages = false,
+  historyQuickView = 'all',
 }: CampusActionStudioProps) {
   const { getToken } = useAuth();
   const { user } = useUser();
@@ -460,6 +495,8 @@ export function CampusActionStudio({
   const [isConfirmingPickupId, setIsConfirmingPickupId] = useState('');
   const [isRevertingPickupId, setIsRevertingPickupId] = useState('');
   const [historyFilter, setHistoryFilter] = useState<HistoryFilter>('all');
+  const [historySortMode, setHistorySortMode] = useState<HistorySortMode>('latest');
+  const [historySearchText, setHistorySearchText] = useState('');
   const [focusedHistoryClaimId, setFocusedHistoryClaimId] = useState('');
 
   const [pickupNotice, setPickupNotice] = useState<{
@@ -502,6 +539,35 @@ export function CampusActionStudio({
   const [actionNotice, setActionNotice] = useState('');
 
   useEffect(() => {
+    if (layout !== 'history') {
+      return;
+    }
+
+    setHistorySearchText('');
+
+    if (historyQuickView === 'needs-action') {
+      setHistoryFilter('all');
+      setHistorySortMode('action');
+      return;
+    }
+
+    if (historyQuickView === 'active') {
+      setHistoryFilter('all');
+      setHistorySortMode('latest');
+      return;
+    }
+
+    if (historyQuickView === 'completed') {
+      setHistoryFilter('all');
+      setHistorySortMode('latest');
+      return;
+    }
+
+    setHistoryFilter('all');
+    setHistorySortMode('latest');
+  }, [historyQuickView, layout]);
+
+  useEffect(() => {
     getTokenRef.current = getToken;
   }, [getToken]);
 
@@ -523,6 +589,9 @@ export function CampusActionStudio({
   const showComposerSections = layout !== 'history';
   const showClaimOperations = layout !== 'quick';
   const showLostBoard = layout !== 'history';
+  const showHistoryFocusedSectionOnly = layout === 'history' && historyQuickView !== 'all';
+  const showClaimInboxSection = showClaimOperations && !showHistoryFocusedSectionOnly;
+  const showPickupSection = showClaimOperations && !showHistoryFocusedSectionOnly;
 
   const pickupQueue = useMemo(
     () =>
@@ -536,21 +605,124 @@ export function CampusActionStudio({
     [claimHistory, compact, currentUserId],
   );
 
+  const historySearchQuery = useMemo(
+    () => historySearchText.trim().toLowerCase(),
+    [historySearchText],
+  );
+
   const filteredHistory = useMemo(() => {
+    const applyManualHistoryFilter = !showHistoryFocusedSectionOnly;
+
     const filtered = claimHistory.filter((entry) => {
-      if (historyFilter === 'active') {
-        return entry.status === 'submitted' || entry.status === 'approved';
+      if (layout === 'history') {
+        if (historyQuickView === 'needs-action' && !isHistoryEntryActionNeeded(entry, currentUserId)) {
+          return false;
+        }
+
+        if (historyQuickView === 'active' && entry.status !== 'submitted' && entry.status !== 'approved') {
+          return false;
+        }
+
+        if (historyQuickView === 'completed' && (entry.status === 'submitted' || entry.status === 'approved')) {
+          return false;
+        }
       }
 
-      if (historyFilter === 'completed') {
-        return entry.status !== 'submitted' && entry.status !== 'approved';
+      if (
+        applyManualHistoryFilter &&
+        historyFilter === 'active' &&
+        entry.status !== 'submitted' &&
+        entry.status !== 'approved'
+      ) {
+        return false;
       }
 
-      return true;
+      if (
+        applyManualHistoryFilter &&
+        historyFilter === 'completed' &&
+        (entry.status === 'submitted' || entry.status === 'approved')
+      ) {
+        return false;
+      }
+
+      if (!historySearchQuery) {
+        return true;
+      }
+
+      const searchableText = [
+        safeString(entry.found_item.title),
+        safeString(entry.found_item.location),
+        safeString(entry.found_item.category),
+        safeString(entry.lost_item?.title),
+        safeString(entry.lost_item?.category),
+        safeString(entry.ai_detected_label),
+        safeString(entry.status),
+      ]
+        .join(' ')
+        .toLowerCase();
+
+      return searchableText.includes(historySearchQuery);
     });
 
-    return filtered.slice(0, compact ? 3 : 8);
-  }, [claimHistory, compact, historyFilter]);
+    const statusPriority = (status: string): number => {
+      if (status === 'approved') {
+        return 3;
+      }
+
+      if (status === 'submitted') {
+        return 2;
+      }
+
+      if (status === 'picked_up') {
+        return 1;
+      }
+
+      return 0;
+    };
+
+    const sorted = [...filtered].sort((left, right) => {
+      if (historySortMode === 'match') {
+        if (right.match_score !== left.match_score) {
+          return right.match_score - left.match_score;
+        }
+
+        return toTimestampMs(right.created_at) - toTimestampMs(left.created_at);
+      }
+
+      if (historySortMode === 'action') {
+        const leftNeedsAction = isHistoryEntryActionNeeded(left, currentUserId) ? 1 : 0;
+        const rightNeedsAction = isHistoryEntryActionNeeded(right, currentUserId) ? 1 : 0;
+
+        if (rightNeedsAction !== leftNeedsAction) {
+          return rightNeedsAction - leftNeedsAction;
+        }
+
+        const rightPriority = statusPriority(right.status);
+        const leftPriority = statusPriority(left.status);
+
+        if (rightPriority !== leftPriority) {
+          return rightPriority - leftPriority;
+        }
+
+        return toTimestampMs(right.created_at) - toTimestampMs(left.created_at);
+      }
+
+      return toTimestampMs(right.created_at) - toTimestampMs(left.created_at);
+    });
+
+    const visibleLimit = compact ? 3 : layout === 'history' ? 24 : 8;
+    return sorted.slice(0, visibleLimit);
+  }, [
+    claimHistory,
+    compact,
+    currentUserId,
+    historyQuickView,
+    historyFilter,
+    historySearchQuery,
+    historySortMode,
+    layout,
+    showHistoryFocusedSectionOnly,
+  ]);
 
   const historyOverview = useMemo(() => {
     const active = claimHistory.filter(
@@ -559,15 +731,33 @@ export function CampusActionStudio({
     const completed = claimHistory.filter(
       (entry) => entry.status !== 'submitted' && entry.status !== 'approved',
     ).length;
+    const needsAction = claimHistory.filter((entry) => isHistoryEntryActionNeeded(entry, currentUserId)).length;
 
     return {
       all: claimHistory.length,
       active,
       completed,
+      needsAction,
     };
-  }, [claimHistory]);
+  }, [claimHistory, currentUserId]);
 
   const historyEmptySubtitle = useMemo(() => {
+    if (historySearchQuery) {
+      return `No claims match "${historySearchText.trim()}".`;
+    }
+
+    if (layout === 'history' && historyQuickView === 'needs-action') {
+      return 'No claims need your action right now.';
+    }
+
+    if (layout === 'history' && historyQuickView === 'active') {
+      return 'No active approved claims right now.';
+    }
+
+    if (layout === 'history' && historyQuickView === 'completed') {
+      return 'No completed or closed claims yet.';
+    }
+
     if (historyFilter === 'active') {
       return 'No active approved claims right now.';
     }
@@ -577,7 +767,23 @@ export function CampusActionStudio({
     }
 
     return 'No claim activity recorded yet.';
-  }, [historyFilter]);
+  }, [historyFilter, historyQuickView, historySearchQuery, historySearchText, layout]);
+
+  const historySectionSubtitle = useMemo(() => {
+    if (layout !== 'history' || historyQuickView === 'all') {
+      return 'Track approvals, pickup status, and claim chat.';
+    }
+
+    if (historyQuickView === 'needs-action') {
+      return 'Showing only claims that require your action right now.';
+    }
+
+    if (historyQuickView === 'active') {
+      return 'Showing only active claim requests in progress.';
+    }
+
+    return 'Showing only completed or closed claim records.';
+  }, [historyQuickView, layout]);
 
   const selectedClaimItem = useMemo(
     () => claimableItems.find((item) => item.id === selectedClaimItemId) ?? null,
@@ -1779,10 +1985,10 @@ export function CampusActionStudio({
         </View>
       ) : null}
 
-      {showClaimOperations ? (
+      {showClaimInboxSection ? (
         <>
           <View style={styles.claimSectionHeaderCard}>
-            <View>
+            <View style={styles.claimSectionHeaderContent}>
               <Text style={styles.boardTitle}>Claim Inbox</Text>
               <Text style={styles.sectionSupportText}>Owner requests waiting for your review.</Text>
             </View>
@@ -1866,175 +2072,293 @@ export function CampusActionStudio({
             </View>
           )}
 
-          {pickupQueue.length ? (
-            <>
-              <View style={styles.claimSectionHeaderCardCompact}>
-                <View>
-                  <Text style={styles.boardTitle}>Pickup Confirmation</Text>
-                  <Text style={styles.sectionSupportText}>Finalize handover after owner verification.</Text>
-                </View>
-                <View style={styles.sectionCountBadgeMuted}>
-                  <MaterialIcons color={colors.primary} name="task-alt" size={13} />
-                  <Text style={styles.sectionCountBadgeMutedText}>{pickupQueue.length}</Text>
-                </View>
+
+        </>
+      ) : null}
+
+      {showPickupSection && pickupQueue.length ? (
+        <>
+          <View style={styles.claimSectionHeaderCardCompact}>
+            <View style={styles.claimSectionHeaderContent}>
+              <Text style={styles.boardTitle}>Pickup Confirmation</Text>
+              <Text style={styles.sectionSupportText}>Finalize handover after owner verification.</Text>
+            </View>
+            <View style={styles.sectionCountBadgeMuted}>
+              <MaterialIcons color={colors.primary} name="task-alt" size={13} />
+              <Text style={styles.sectionCountBadgeMutedText}>{pickupQueue.length}</Text>
+            </View>
+          </View>
+
+          {pickupQueue.map((claim) => (
+            <View key={`pickup-${claim.id}`} style={styles.claimCard}>
+              <View style={styles.claimHeaderRow}>
+                <Text numberOfLines={1} style={styles.claimTitle}>
+                  {claim.found_item.title}
+                </Text>
+                <Text style={styles.claimScore}>Approved</Text>
               </View>
 
-              {pickupQueue.map((claim) => (
-                <View key={`pickup-${claim.id}`} style={styles.claimCard}>
-                  <View style={styles.claimHeaderRow}>
-                    <Text numberOfLines={1} style={styles.claimTitle}>
-                      {claim.found_item.title}
-                    </Text>
-                    <Text style={styles.claimScore}>Approved</Text>
-                  </View>
+              <Text numberOfLines={1} style={styles.claimMetaText}>
+                Owner verified. Mark picked up after handover.
+              </Text>
 
-                  <Text numberOfLines={1} style={styles.claimMetaText}>
-                    Owner verified. Mark picked up after handover.
-                  </Text>
+              <View style={styles.claimActionRow}>
+                <Pressable onPress={() => void openMessages(claim)} style={styles.messageButton}>
+                  <MaterialIcons color={colors.onSurfaceVariant} name="chat-bubble-outline" size={14} />
+                  <Text style={styles.messageButtonText}>Message</Text>
+                </Pressable>
 
-                  <View style={styles.claimActionRow}>
-                    <Pressable onPress={() => void openMessages(claim)} style={styles.messageButton}>
-                      <MaterialIcons color={colors.onSurfaceVariant} name="chat-bubble-outline" size={14} />
-                      <Text style={styles.messageButtonText}>Message</Text>
-                    </Pressable>
+                <Pressable
+                  disabled={Boolean(isConfirmingPickupId)}
+                  onPress={() => void confirmPickup(claim.id)}
+                  style={styles.pickupButtonCompact}
+                >
+                  {isConfirmingPickupId === claim.id ? (
+                    <ActivityIndicator color={colors.onPrimary} size="small" />
+                  ) : (
+                    <View style={styles.actionButtonInnerRow}>
+                      <MaterialIcons color={colors.onPrimary} name="task-alt" size={14} />
+                      <Text style={styles.pickupButtonText}>Mark Picked Up</Text>
+                    </View>
+                  )}
+                </Pressable>
+              </View>
+            </View>
+          ))}
+        </>
+      ) : null}
 
-                    <Pressable
-                      disabled={Boolean(isConfirmingPickupId)}
-                      onPress={() => void confirmPickup(claim.id)}
-                      style={styles.pickupButtonCompact}
-                    >
-                      {isConfirmingPickupId === claim.id ? (
-                        <ActivityIndicator color={colors.onPrimary} size="small" />
-                      ) : (
-                        <View style={styles.actionButtonInnerRow}>
-                          <MaterialIcons color={colors.onPrimary} name="task-alt" size={14} />
-                          <Text style={styles.pickupButtonText}>Mark Picked Up</Text>
-                        </View>
-                      )}
-                    </Pressable>
-                  </View>
-                </View>
-              ))}
-            </>
-          ) : null}
-
+      {showClaimOperations ? (
+        <>
           <View style={styles.claimSectionHeaderCard}>
-            <View>
+            <View style={styles.claimSectionHeaderContent}>
               <Text style={styles.boardTitle}>Claim History</Text>
-              <Text style={styles.sectionSupportText}>Track approvals, pickup status, and claim chat.</Text>
+              <Text style={styles.sectionSupportText}>{historySectionSubtitle}</Text>
             </View>
             <View style={styles.sectionCountBadge}>
               <MaterialIcons color={colors.onPrimary} name="history" size={13} />
-              <Text style={styles.sectionCountBadgeText}>{historyOverview.all}</Text>
+              <Text style={styles.sectionCountBadgeText}>
+                {showHistoryFocusedSectionOnly ? filteredHistory.length : historyOverview.all}
+              </Text>
             </View>
           </View>
 
-          <View style={styles.historyOverviewRow}>
-            <View style={styles.historyOverviewCard}>
-              <Text style={styles.historyOverviewValue}>{historyOverview.all}</Text>
-              <Text style={styles.historyOverviewLabel}>Total</Text>
+          {!showHistoryFocusedSectionOnly ? (
+            <View style={styles.historyOverviewRow}>
+              <View style={styles.historyOverviewCard}>
+                <Text style={styles.historyOverviewValue}>{historyOverview.all}</Text>
+                <Text style={styles.historyOverviewLabel}>Total</Text>
+              </View>
+              <View style={styles.historyOverviewCard}>
+                <Text style={styles.historyOverviewValue}>{historyOverview.active}</Text>
+                <Text style={styles.historyOverviewLabel}>Active</Text>
+              </View>
+              <View style={[styles.historyOverviewCard, { marginRight: 0 }]}>
+                <Text style={styles.historyOverviewValue}>{historyOverview.completed}</Text>
+                <Text style={styles.historyOverviewLabel}>Completed</Text>
+              </View>
             </View>
-            <View style={styles.historyOverviewCard}>
-              <Text style={styles.historyOverviewValue}>{historyOverview.active}</Text>
-              <Text style={styles.historyOverviewLabel}>Active</Text>
+          ) : null}
+
+          {!showHistoryFocusedSectionOnly ? (
+            <View style={styles.historyActionSummaryCard}>
+              <View style={styles.historyActionSummaryHead}>
+                <MaterialIcons color={colors.primary} name="bolt" size={14} />
+                <Text style={styles.historyActionSummaryTitle}>Needs your action</Text>
+              </View>
+              <Text style={styles.historyActionSummaryValue}>{historyOverview.needsAction}</Text>
+              <Text style={styles.historyActionSummaryHint}>
+                Review pending claims and complete approved pickups without opening each card.
+              </Text>
             </View>
-            <View style={[styles.historyOverviewCard, { marginRight: 0 }]}>
-              <Text style={styles.historyOverviewValue}>{historyOverview.completed}</Text>
-              <Text style={styles.historyOverviewLabel}>Completed</Text>
+          ) : null}
+
+          {!showHistoryFocusedSectionOnly ? (
+            <View style={styles.historyFilterRow}>
+              <Pressable
+                onPress={() => setHistoryFilter('all')}
+                style={[
+                  styles.historyFilterChip,
+                  historyFilter === 'all' ? styles.historyFilterChipActive : undefined,
+                ]}
+              >
+                <MaterialIcons
+                  color={historyFilter === 'all' ? colors.onPrimary : colors.onSurfaceVariant}
+                  name="view-list"
+                  size={14}
+                />
+                <Text
+                  style={[
+                    styles.historyFilterText,
+                    historyFilter === 'all' ? styles.historyFilterTextActive : undefined,
+                  ]}
+                >
+                  All
+                </Text>
+                <Text
+                  style={[
+                    styles.historyFilterCount,
+                    historyFilter === 'all' ? styles.historyFilterCountActive : undefined,
+                  ]}
+                >
+                  {historyOverview.all}
+                </Text>
+              </Pressable>
+
+              <Pressable
+                onPress={() => setHistoryFilter('active')}
+                style={[
+                  styles.historyFilterChip,
+                  historyFilter === 'active' ? styles.historyFilterChipActive : undefined,
+                ]}
+              >
+                <MaterialIcons
+                  color={historyFilter === 'active' ? colors.onPrimary : colors.onSurfaceVariant}
+                  name="autorenew"
+                  size={14}
+                />
+                <Text
+                  style={[
+                    styles.historyFilterText,
+                    historyFilter === 'active' ? styles.historyFilterTextActive : undefined,
+                  ]}
+                >
+                  Active
+                </Text>
+                <Text
+                  style={[
+                    styles.historyFilterCount,
+                    historyFilter === 'active' ? styles.historyFilterCountActive : undefined,
+                  ]}
+                >
+                  {historyOverview.active}
+                </Text>
+              </Pressable>
+
+              <Pressable
+                onPress={() => setHistoryFilter('completed')}
+                style={[
+                  styles.historyFilterChip,
+                  { marginRight: 0 },
+                  historyFilter === 'completed' ? styles.historyFilterChipActive : undefined,
+                ]}
+              >
+                <MaterialIcons
+                  color={historyFilter === 'completed' ? colors.onPrimary : colors.onSurfaceVariant}
+                  name="task-alt"
+                  size={14}
+                />
+                <Text
+                  style={[
+                    styles.historyFilterText,
+                    historyFilter === 'completed' ? styles.historyFilterTextActive : undefined,
+                  ]}
+                >
+                  Completed
+                </Text>
+                <Text
+                  style={[
+                    styles.historyFilterCount,
+                    historyFilter === 'completed' ? styles.historyFilterCountActive : undefined,
+                  ]}
+                >
+                  {historyOverview.completed}
+                </Text>
+              </Pressable>
             </View>
-          </View>
+          ) : null}
 
-          <View style={styles.historyFilterRow}>
-            <Pressable
-              onPress={() => setHistoryFilter('all')}
-              style={[
-                styles.historyFilterChip,
-                historyFilter === 'all' ? styles.historyFilterChipActive : undefined,
-              ]}
-            >
-              <MaterialIcons
-                color={historyFilter === 'all' ? colors.onPrimary : colors.onSurfaceVariant}
-                name="view-list"
-                size={14}
+          <View style={styles.historyControlsCard}>
+            <View style={styles.historySearchWrap}>
+              <MaterialIcons color={colors.onSurfaceVariant} name="search" size={16} />
+              <TextInput
+                onChangeText={setHistorySearchText}
+                placeholder="Search by title, location, category, or status"
+                placeholderTextColor="rgba(69, 70, 82, 0.65)"
+                style={styles.historySearchInput}
+                value={historySearchText}
               />
-              <Text
-                style={[
-                  styles.historyFilterText,
-                  historyFilter === 'all' ? styles.historyFilterTextActive : undefined,
-                ]}
-              >
-                All
-              </Text>
-              <Text
-                style={[
-                  styles.historyFilterCount,
-                  historyFilter === 'all' ? styles.historyFilterCountActive : undefined,
-                ]}
-              >
-                {historyOverview.all}
-              </Text>
-            </Pressable>
+              {historySearchText ? (
+                <Pressable
+                  onPress={() => setHistorySearchText('')}
+                  style={styles.historySearchClearButton}
+                >
+                  <MaterialIcons color={colors.onSurfaceVariant} name="close" size={14} />
+                </Pressable>
+              ) : null}
+            </View>
 
-            <Pressable
-              onPress={() => setHistoryFilter('active')}
-              style={[
-                styles.historyFilterChip,
-                historyFilter === 'active' ? styles.historyFilterChipActive : undefined,
-              ]}
+            <ScrollView
+              contentContainerStyle={styles.historySortRow}
+              horizontal
+              showsHorizontalScrollIndicator={false}
             >
-              <MaterialIcons
-                color={historyFilter === 'active' ? colors.onPrimary : colors.onSurfaceVariant}
-                name="autorenew"
-                size={14}
-              />
-              <Text
+              <Pressable
+                onPress={() => setHistorySortMode('latest')}
                 style={[
-                  styles.historyFilterText,
-                  historyFilter === 'active' ? styles.historyFilterTextActive : undefined,
+                  styles.historySortChip,
+                  historySortMode === 'latest' ? styles.historySortChipActive : undefined,
                 ]}
               >
-                Active
-              </Text>
-              <Text
-                style={[
-                  styles.historyFilterCount,
-                  historyFilter === 'active' ? styles.historyFilterCountActive : undefined,
-                ]}
-              >
-                {historyOverview.active}
-              </Text>
-            </Pressable>
+                <MaterialIcons
+                  color={historySortMode === 'latest' ? colors.onPrimary : colors.onSurfaceVariant}
+                  name="schedule"
+                  size={13}
+                />
+                <Text
+                  style={[
+                    styles.historySortChipText,
+                    historySortMode === 'latest' ? styles.historySortChipTextActive : undefined,
+                  ]}
+                >
+                  Latest
+                </Text>
+              </Pressable>
 
-            <Pressable
-              onPress={() => setHistoryFilter('completed')}
-              style={[
-                styles.historyFilterChip,
-                { marginRight: 0 },
-                historyFilter === 'completed' ? styles.historyFilterChipActive : undefined,
-              ]}
-            >
-              <MaterialIcons
-                color={historyFilter === 'completed' ? colors.onPrimary : colors.onSurfaceVariant}
-                name="task-alt"
-                size={14}
-              />
-              <Text
+              <Pressable
+                onPress={() => setHistorySortMode('match')}
                 style={[
-                  styles.historyFilterText,
-                  historyFilter === 'completed' ? styles.historyFilterTextActive : undefined,
+                  styles.historySortChip,
+                  historySortMode === 'match' ? styles.historySortChipActive : undefined,
                 ]}
               >
-                Completed
-              </Text>
-              <Text
+                <MaterialIcons
+                  color={historySortMode === 'match' ? colors.onPrimary : colors.onSurfaceVariant}
+                  name="percent"
+                  size={13}
+                />
+                <Text
+                  style={[
+                    styles.historySortChipText,
+                    historySortMode === 'match' ? styles.historySortChipTextActive : undefined,
+                  ]}
+                >
+                  Highest Match
+                </Text>
+              </Pressable>
+
+              <Pressable
+                onPress={() => setHistorySortMode('action')}
                 style={[
-                  styles.historyFilterCount,
-                  historyFilter === 'completed' ? styles.historyFilterCountActive : undefined,
+                  styles.historySortChip,
+                  historySortMode === 'action' ? styles.historySortChipActive : undefined,
                 ]}
               >
-                {historyOverview.completed}
-              </Text>
-            </Pressable>
+                <MaterialIcons
+                  color={historySortMode === 'action' ? colors.onPrimary : colors.onSurfaceVariant}
+                  name="bolt"
+                  size={13}
+                />
+                <Text
+                  style={[
+                    styles.historySortChipText,
+                    historySortMode === 'action' ? styles.historySortChipTextActive : undefined,
+                  ]}
+                >
+                  Action First
+                </Text>
+              </Pressable>
+            </ScrollView>
           </View>
 
           {filteredHistory.length ? (
@@ -2044,10 +2368,22 @@ export function CampusActionStudio({
               const isClaimant = safeString(entry.claimant_user_id) === currentUserId;
               const roleLabel = isOwner ? 'Uploader' : isClaimant ? 'Claimant' : 'Participant';
               const canMessage = entry.status !== 'picked_up';
+              const canMarkPickup = isOwner && entry.status === 'approved';
               const canUndoPickup =
                 isOwner &&
                 entry.status === 'picked_up' &&
                 (entry.pickup_is_editable || entry.pickup_edit_seconds_remaining > 0);
+              const needsAction = isHistoryEntryActionNeeded(entry, currentUserId);
+              const actionHint =
+                isOwner && entry.status === 'submitted'
+                  ? 'Review this request to approve or reject ownership proof.'
+                  : canMarkPickup
+                    ? 'Confirm pickup once handover is completed with the claimant.'
+                    : canUndoPickup
+                      ? `Pickup can be undone for ${minutesLeft(entry.pickup_edit_seconds_remaining)} more minute(s).`
+                      : isClaimant && entry.status === 'approved'
+                        ? 'Your claim is approved. Coordinate with uploader and collect item.'
+                        : '';
               const isFocusedHistoryEntry =
                 Boolean(focusedHistoryClaimId) && entry.id === focusedHistoryClaimId;
 
@@ -2077,6 +2413,31 @@ export function CampusActionStudio({
                       {formatStatusLabel(entry.status)}
                     </Text>
                   </View>
+
+                  <View style={styles.historyContextRow}>
+                    <View style={styles.historyContextPill}>
+                      <MaterialIcons color={colors.onSurfaceVariant} name="place" size={13} />
+                      <Text numberOfLines={1} style={styles.historyContextPillText}>
+                        {safeString(entry.found_item.location) || 'Campus location'}
+                      </Text>
+                    </View>
+
+                    {entry.ai_detected_label ? (
+                      <View style={styles.historyContextPill}>
+                        <MaterialIcons color={colors.primary} name="auto-awesome" size={13} />
+                        <Text numberOfLines={1} style={styles.historyContextPillText}>
+                          {entry.ai_detected_label}
+                        </Text>
+                      </View>
+                    ) : null}
+                  </View>
+
+                  {needsAction && actionHint ? (
+                    <View style={styles.historyActionHintCard}>
+                      <MaterialIcons color={colors.primary} name="notification-important" size={14} />
+                      <Text style={styles.historyActionHintText}>{actionHint}</Text>
+                    </View>
+                  ) : null}
 
                   <View style={styles.historyMetaWrap}>
                     <View style={styles.historyMetaPill}>
@@ -2119,7 +2480,7 @@ export function CampusActionStudio({
                     </View>
                   ) : null}
 
-                  {(canMessage || canUndoPickup || (isOwner && entry.status === 'approved')) ? (
+                  {(canMessage || canUndoPickup || canMarkPickup) ? (
                     <View style={styles.historyActionsRow}>
                       {canMessage ? (
                         <Pressable onPress={() => void openMessages(entry)} style={styles.historyMessageButton}>
@@ -2128,7 +2489,7 @@ export function CampusActionStudio({
                         </Pressable>
                       ) : null}
 
-                      {isOwner && entry.status === 'approved' ? (
+                      {canMarkPickup ? (
                         <Pressable
                           disabled={Boolean(isConfirmingPickupId)}
                           onPress={() => void confirmPickup(entry.id)}
@@ -2973,6 +3334,11 @@ const styles = StyleSheet.create({
     paddingHorizontal: 12,
     paddingVertical: 9,
   },
+  claimSectionHeaderContent: {
+    flex: 1,
+    marginRight: 10,
+    minWidth: 0,
+  },
   boardTitle: {
     color: colors.primary,
     fontFamily: fontFamily.headlineBold,
@@ -2986,10 +3352,12 @@ const styles = StyleSheet.create({
     marginTop: 3,
   },
   sectionCountBadge: {
+    alignSelf: 'center',
     alignItems: 'center',
     backgroundColor: colors.primary,
     borderRadius: radii.pill,
     flexDirection: 'row',
+    flexShrink: 0,
     justifyContent: 'center',
     minWidth: 34,
     paddingHorizontal: 9,
@@ -3002,10 +3370,12 @@ const styles = StyleSheet.create({
     marginLeft: 4,
   },
   sectionCountBadgeMuted: {
+    alignSelf: 'center',
     alignItems: 'center',
     backgroundColor: '#E2EBFF',
     borderRadius: radii.pill,
     flexDirection: 'row',
+    flexShrink: 0,
     justifyContent: 'center',
     minWidth: 34,
     paddingHorizontal: 9,
@@ -3186,6 +3556,40 @@ const styles = StyleSheet.create({
     marginTop: 2,
     textTransform: 'uppercase',
   },
+  historyActionSummaryCard: {
+    alignItems: 'flex-start',
+    backgroundColor: '#F3F7FF',
+    borderColor: '#D7E3FA',
+    borderRadius: radii.md,
+    borderWidth: 1,
+    marginBottom: 10,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+  },
+  historyActionSummaryHead: {
+    alignItems: 'center',
+    flexDirection: 'row',
+  },
+  historyActionSummaryTitle: {
+    color: colors.primary,
+    fontFamily: fontFamily.bodySemiBold,
+    fontSize: 12,
+    marginLeft: 5,
+    textTransform: 'uppercase',
+  },
+  historyActionSummaryValue: {
+    color: colors.primary,
+    fontFamily: fontFamily.headlineExtraBold,
+    fontSize: 28,
+    marginTop: 3,
+  },
+  historyActionSummaryHint: {
+    color: colors.onSurfaceVariant,
+    fontFamily: fontFamily.bodyMedium,
+    fontSize: 12,
+    lineHeight: 17,
+    marginTop: 2,
+  },
   historyFilterRow: {
     alignItems: 'center',
     backgroundColor: '#F8FAFF',
@@ -3234,6 +3638,70 @@ const styles = StyleSheet.create({
   historyFilterCountActive: {
     color: colors.onPrimary,
     opacity: 1,
+  },
+  historyControlsCard: {
+    backgroundColor: '#F9FBFF',
+    borderColor: '#DFE8FA',
+    borderRadius: radii.md,
+    borderWidth: 1,
+    marginBottom: 12,
+    padding: 8,
+  },
+  historySearchWrap: {
+    alignItems: 'center',
+    backgroundColor: colors.surface,
+    borderColor: '#D7E2F8',
+    borderRadius: radii.pill,
+    borderWidth: 1,
+    flexDirection: 'row',
+    paddingHorizontal: 10,
+    paddingVertical: 7,
+  },
+  historySearchInput: {
+    color: colors.onSurface,
+    flex: 1,
+    fontFamily: fontFamily.bodyMedium,
+    fontSize: 12,
+    marginLeft: 7,
+    paddingVertical: 0,
+  },
+  historySearchClearButton: {
+    alignItems: 'center',
+    backgroundColor: '#EEF2FA',
+    borderRadius: radii.pill,
+    height: 22,
+    justifyContent: 'center',
+    width: 22,
+  },
+  historySortRow: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    marginTop: 8,
+    paddingRight: 6,
+  },
+  historySortChip: {
+    alignItems: 'center',
+    backgroundColor: '#EDF3FF',
+    borderColor: '#D9E5FA',
+    borderRadius: radii.pill,
+    borderWidth: 1,
+    flexDirection: 'row',
+    marginRight: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 7,
+  },
+  historySortChipActive: {
+    backgroundColor: colors.primary,
+    borderColor: colors.primary,
+  },
+  historySortChipText: {
+    color: colors.onSurfaceVariant,
+    fontFamily: fontFamily.bodySemiBold,
+    fontSize: 11,
+    marginLeft: 4,
+  },
+  historySortChipTextActive: {
+    color: colors.onPrimary,
   },
   historyCard: {
     backgroundColor: '#FCFDFF',
@@ -3304,6 +3772,49 @@ const styles = StyleSheet.create({
     paddingHorizontal: 8,
     paddingVertical: 4,
     textTransform: 'uppercase',
+  },
+  historyContextRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    marginTop: 8,
+  },
+  historyContextPill: {
+    alignItems: 'center',
+    backgroundColor: '#EEF3FE',
+    borderColor: '#DCE5F7',
+    borderRadius: radii.pill,
+    borderWidth: 1,
+    flexDirection: 'row',
+    marginBottom: 6,
+    marginRight: 6,
+    maxWidth: '100%',
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+  },
+  historyContextPillText: {
+    color: colors.onSurfaceVariant,
+    fontFamily: fontFamily.bodyMedium,
+    fontSize: 11,
+    marginLeft: 4,
+  },
+  historyActionHintCard: {
+    alignItems: 'flex-start',
+    backgroundColor: '#EAF1FF',
+    borderColor: '#CBDDFF',
+    borderRadius: radii.md,
+    borderWidth: 1,
+    flexDirection: 'row',
+    marginTop: 4,
+    paddingHorizontal: 9,
+    paddingVertical: 7,
+  },
+  historyActionHintText: {
+    color: colors.primary,
+    flex: 1,
+    fontFamily: fontFamily.bodySemiBold,
+    fontSize: 11,
+    lineHeight: 15,
+    marginLeft: 6,
   },
   historyMeta: {
     color: colors.onSurfaceVariant,

@@ -16,7 +16,7 @@ import {
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { AppTopBar } from '../components/AppTopBar';
-import { buildSupabaseClient } from '../lib/supabase';
+import { backendEnv } from '../config/env';
 import { colors, fontFamily, radii, shadows } from '../theme/tokens';
 
 type SettingsTabParamList = {
@@ -59,6 +59,8 @@ const DEFAULT_SETTINGS_FORM: SettingsFormState = {
   publicProfile: true,
 };
 
+const SETTINGS_REQUEST_TIMEOUT_MS = 15000;
+
 const settingsSignature = (form: SettingsFormState): string => {
   return [form.notifyClaimUpdates, form.notifyMessages, form.publicProfile].join('|');
 };
@@ -67,71 +69,53 @@ const readText = (value: unknown): string => {
   return typeof value === 'string' ? value.trim() : '';
 };
 
+const readBoolean = (value: unknown, fallback: boolean): boolean => {
+  if (typeof value === 'boolean') {
+    return value;
+  }
+
+  if (typeof value === 'string') {
+    const normalized = value.trim().toLowerCase();
+    if (normalized === 'true') {
+      return true;
+    }
+
+    if (normalized === 'false') {
+      return false;
+    }
+  }
+
+  return fallback;
+};
+
 const tokenMissingMessage = (): string => {
-  return 'Authentication token missing. Sign out and sign in again. If you use Clerk templates, ensure supabase exists.';
+  return 'Authentication token missing. Sign out and sign in again.';
 };
 
 const isRecord = (value: unknown): value is Record<string, unknown> => {
   return typeof value === 'object' && value !== null;
 };
 
-const isRlsPolicyError = (error: unknown): boolean => {
-  if (!isRecord(error)) {
-    return false;
-  }
-
-  const code = readText(error.code);
-  const message = readText(error.message).toLowerCase();
-
-  return code === '42501' || message.includes('row-level security');
-};
-
-const isMissingSchemaError = (error: unknown): boolean => {
-  if (!isRecord(error)) {
-    return false;
-  }
-
-  const code = readText(error.code);
-  const message = readText(error.message).toLowerCase();
-
-  return code === '42P01' || message.includes('does not exist');
-};
-
 const normalizeSettingsErrorMessage = (error: unknown, fallback: string): string => {
-  if (!isRecord(error)) {
-    return fallback;
-  }
+  const extractedMessage =
+    isRecord(error) && typeof error.message === 'string' ? readText(error.message) : '';
 
-  const message = readText(error.message);
-  const details = readText(error.details);
+  if (extractedMessage) {
+    const normalized = extractedMessage.toLowerCase();
 
-  if (message.includes('No suitable key') || message.includes('wrong key type')) {
-    return 'Clerk JWT template supabase is using the wrong signing key type. Use RS256 and retry.';
-  }
+    if (normalized.includes('failed to fetch') || normalized.includes('network request failed')) {
+      return 'Network issue while syncing settings. Check your internet and retry.';
+    }
 
-  if (message.includes('No JWT template exists with name')) {
-    return 'Clerk JWT template supabase was not found. The app can use session token fallback, but you may still create that template for consistency.';
-  }
-
-  if (message.includes('jwt malformed') || message.includes('Invalid JWT')) {
-    return 'Authentication token is invalid. Sign out and sign in again.';
-  }
-
-  if (message) {
-    return details ? `${message} (${details})` : message;
+    return extractedMessage;
   }
 
   return fallback;
 };
 
-async function resolveSupabaseAccessToken(getToken?: GetTokenFn): Promise<string | null> {
+async function resolveSessionAccessToken(getToken?: GetTokenFn): Promise<string | null> {
   if (!getToken) {
     return null;
-  }
-
-  const templateToken = await getToken({ template: 'supabase' }).catch(() => null);
-  if (templateToken && readText(templateToken).length > 0) {
-    return templateToken;
   }
 
   const sessionToken = await getToken().catch(() => null);
@@ -146,6 +130,47 @@ async function resolveSupabaseAccessToken(getToken?: GetTokenFn): Promise<string
   }
 
   return null;
+}
+
+async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    return await fetch(url, {
+      ...init,
+      signal: controller.signal,
+    });
+  } catch (error) {
+    const aborted = error instanceof Error && error.name === 'AbortError';
+    if (aborted) {
+      throw new Error('Settings request timed out. Check your internet connection and retry.');
+    }
+
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function readResponseError(response: Response, fallbackMessage: string): Promise<string> {
+  if (response.status === 404) {
+    return 'Backend settings route is not available. Deploy the latest backend and retry.';
+  }
+
+  try {
+    const payload = (await response.json()) as { error?: unknown; details?: unknown };
+    const errorMessage = readText(payload.error);
+    const detailsMessage = readText(payload.details);
+
+    if (errorMessage && detailsMessage) {
+      return `${errorMessage} (${detailsMessage})`;
+    }
+
+    return errorMessage || detailsMessage || fallbackMessage;
+  } catch {
+    return fallbackMessage;
+  }
 }
 
 export function SettingsScreen() {
@@ -174,6 +199,35 @@ export function SettingsScreen() {
     return user?.primaryEmailAddress?.emailAddress || user?.emailAddresses?.[0]?.emailAddress || '';
   }, [user]);
 
+  const backendBaseUrl = useMemo(() => backendEnv.backendUrl.replace(/\/+$/, ''), []);
+
+  const authedSettingsRequest = useCallback(
+    async (path: string, init: RequestInit) => {
+      if (!backendBaseUrl) {
+        throw new Error('Backend is not configured. Set EXPO_PUBLIC_BACKEND_URL.');
+      }
+
+      const accessToken = await resolveSessionAccessToken(getTokenRef.current);
+      if (!accessToken) {
+        throw new Error(tokenMissingMessage());
+      }
+
+      return await fetchWithTimeout(
+        `${backendBaseUrl}${path}`,
+        {
+          ...init,
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${accessToken}`,
+            ...(init.headers ?? {}),
+          },
+        },
+        SETTINGS_REQUEST_TIMEOUT_MS,
+      );
+    },
+    [backendBaseUrl],
+  );
+
   const loadSettings = useCallback(
     async (options?: LoadSettingsOptions) => {
       if (!isAuthLoaded || !userId) {
@@ -192,61 +246,41 @@ export function SettingsScreen() {
       setErrorMessage('');
 
       try {
-        const accessToken = await resolveSupabaseAccessToken(getTokenRef.current);
+        const response = await authedSettingsRequest('/api/settings/me', {
+          method: 'GET',
+        });
 
-        if (!accessToken) {
-          setErrorMessage(tokenMissingMessage());
-          setSyncStatus('error');
+        if (response.status === 404) {
+          setForm(DEFAULT_SETTINGS_FORM);
+          lastSavedSignatureRef.current = settingsSignature(DEFAULT_SETTINGS_FORM);
+          setSyncStatus('idle');
+          setErrorMessage('');
+          setSuccessMessage('Using compatibility settings mode. Deploy latest backend for cloud sync.');
+          setLastSyncedAt(new Date().toISOString());
           return;
         }
 
-        const client = buildSupabaseClient(accessToken);
-
-        if (!client) {
-          setErrorMessage('Supabase is not configured. Unable to load settings.');
-          setSyncStatus('error');
-          return;
+        if (!response.ok) {
+          throw new Error(await readResponseError(response, 'Could not load settings right now.'));
         }
 
-        const { data, error } = await client
-          .from('user_profiles')
-          .select('notify_claim_updates, notify_messages, public_profile')
-          .eq('user_id', userId)
-          .maybeSingle();
+        const payload = (await response.json()) as {
+          settings?: {
+            notifyClaimUpdates?: unknown;
+            notifyMessages?: unknown;
+            publicProfile?: unknown;
+          };
+        };
 
-        if (error) {
-          if (isMissingSchemaError(error)) {
-            setErrorMessage(
-              'Profile table is missing. Run SQL migration 020_create_user_profiles_and_summary.sql.',
-            );
-            setSyncStatus('error');
-            return;
-          }
-
-          if (isRlsPolicyError(error)) {
-            setErrorMessage(
-              'Permission denied for settings load. Run SQL migration 024_user_profiles_rls_allow_clerk_session_role.sql.',
-            );
-            setSyncStatus('error');
-            return;
-          }
-
-          throw error;
-        }
+        const remote = payload.settings;
 
         const nextForm: SettingsFormState = {
-          notifyClaimUpdates:
-            typeof data?.notify_claim_updates === 'boolean'
-              ? data.notify_claim_updates
-              : DEFAULT_SETTINGS_FORM.notifyClaimUpdates,
-          notifyMessages:
-            typeof data?.notify_messages === 'boolean'
-              ? data.notify_messages
-              : DEFAULT_SETTINGS_FORM.notifyMessages,
-          publicProfile:
-            typeof data?.public_profile === 'boolean'
-              ? data.public_profile
-              : DEFAULT_SETTINGS_FORM.publicProfile,
+          notifyClaimUpdates: readBoolean(
+            remote?.notifyClaimUpdates,
+            DEFAULT_SETTINGS_FORM.notifyClaimUpdates,
+          ),
+          notifyMessages: readBoolean(remote?.notifyMessages, DEFAULT_SETTINGS_FORM.notifyMessages),
+          publicProfile: readBoolean(remote?.publicProfile, DEFAULT_SETTINGS_FORM.publicProfile),
         };
 
         setForm(nextForm);
@@ -260,7 +294,7 @@ export function SettingsScreen() {
         setIsLoading(false);
       }
     },
-    [isAuthLoaded, userId],
+      [authedSettingsRequest, isAuthLoaded, userId],
   );
 
   useEffect(() => {
@@ -290,49 +324,29 @@ export function SettingsScreen() {
       }
 
       try {
-        const accessToken = await resolveSupabaseAccessToken(getTokenRef.current);
+        const response = await authedSettingsRequest('/api/settings/me', {
+          method: 'PUT',
+          body: JSON.stringify({
+            notify_claim_updates: nextForm.notifyClaimUpdates,
+            notify_messages: nextForm.notifyMessages,
+            public_profile: nextForm.publicProfile,
+          }),
+        });
 
-        if (!accessToken) {
-          setErrorMessage(tokenMissingMessage());
-          setSyncStatus('error');
+        if (response.status === 404) {
+          lastSavedSignatureRef.current = currentSignature;
+          setSyncStatus('idle');
+          setLastSyncedAt(new Date().toISOString());
+
+          if (!silent) {
+            setSuccessMessage('Saved locally. Deploy latest backend to enable cloud settings sync.');
+          }
+
           return;
         }
 
-        const client = buildSupabaseClient(accessToken);
-
-        if (!client) {
-          setErrorMessage('Supabase is not configured. Unable to save settings.');
-          setSyncStatus('error');
-          return;
-        }
-
-        const payload = {
-          user_id: userId,
-          notify_claim_updates: nextForm.notifyClaimUpdates,
-          notify_messages: nextForm.notifyMessages,
-          public_profile: nextForm.publicProfile,
-        };
-
-        const { error } = await client.from('user_profiles').upsert(payload, { onConflict: 'user_id' });
-
-        if (error) {
-          if (isMissingSchemaError(error)) {
-            setErrorMessage(
-              'Profile table is missing. Run SQL migration 020_create_user_profiles_and_summary.sql.',
-            );
-            setSyncStatus('error');
-            return;
-          }
-
-          if (isRlsPolicyError(error)) {
-            setErrorMessage(
-              'Permission denied for settings save. Run SQL migration 024_user_profiles_rls_allow_clerk_session_role.sql.',
-            );
-            setSyncStatus('error');
-            return;
-          }
-
-          throw error;
+        if (!response.ok) {
+          throw new Error(await readResponseError(response, 'Could not save settings right now.'));
         }
 
         lastSavedSignatureRef.current = currentSignature;
@@ -353,7 +367,7 @@ export function SettingsScreen() {
         setIsSaving(false);
       }
     },
-    [isAuthLoaded, isSaving, userId],
+      [authedSettingsRequest, isAuthLoaded, isSaving, userId],
   );
 
   useEffect(() => {
