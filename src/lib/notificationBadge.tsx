@@ -8,7 +8,13 @@ import { Platform } from 'react-native';
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 
 import { backendEnv } from '../config/env';
-import { mapHistoryRowsToNotifications, NOTIFICATION_SEEN_STORAGE_PREFIX } from './notifications';
+import {
+  mapInboxRowsToNotifications,
+  mapHistoryRowsToNotifications,
+  mergeNotificationEntries,
+  NOTIFICATION_SEEN_STORAGE_PREFIX,
+  type NotificationEntry,
+} from './notifications';
 
 type NotificationBadgeContextValue = {
   unreadCount: number;
@@ -20,6 +26,11 @@ const NotificationBadgeContext = createContext<NotificationBadgeContextValue | n
 
 const REQUEST_TIMEOUT_MS = 12000;
 const REALTIME_SYNC_INTERVAL_MS = 10000;
+const MAX_FOREGROUND_ALERTS_PER_SYNC = 2;
+
+function isExpoGoRuntime(): boolean {
+  return Constants.executionEnvironment === 'storeClient';
+}
 
 Notifications.setNotificationHandler({
   handleNotification: async () => ({
@@ -67,6 +78,8 @@ export function NotificationBadgeProvider({ children }: { children: React.ReactN
 
   const [unreadCount, setUnreadCountState] = useState(0);
   const [syncNonce, setSyncNonce] = useState(0);
+  const hasHydratedNotificationIdsRef = useRef(false);
+  const knownNotificationIdsRef = useRef<Set<string>>(new Set());
 
   useEffect(() => {
     getTokenRef.current = getToken;
@@ -99,21 +112,46 @@ export function NotificationBadgeProvider({ children }: { children: React.ReactN
     }
 
     try {
-      const response = await fetchWithTimeout(`${backendBaseUrl}/api/match-requests/history/me`, {
-        headers: {
-          Authorization: `Bearer ${token}`,
-        },
-      });
+      const [historyResponse, inboxResponse] = await Promise.all([
+        fetchWithTimeout(`${backendBaseUrl}/api/match-requests/history/me`, {
+          headers: {
+            Authorization: `Bearer ${token}`,
+          },
+        }),
+        fetchWithTimeout(`${backendBaseUrl}/api/notifications/inbox/me`, {
+          headers: {
+            Authorization: `Bearer ${token}`,
+          },
+        }),
+      ]);
 
-      if (!response.ok) {
+      let loadedSources = 0;
+      let historyNotifications: NotificationEntry[] = [];
+      let inboxNotifications: NotificationEntry[] = [];
+
+      if (historyResponse.ok) {
+        const historyPayload = (await historyResponse.json()) as {
+          items?: Record<string, unknown>[];
+        };
+
+        historyNotifications = mapHistoryRowsToNotifications(historyPayload.items, currentUserId, 120);
+        loadedSources += 1;
+      }
+
+      if (inboxResponse.ok) {
+        const inboxPayload = (await inboxResponse.json()) as {
+          items?: Record<string, unknown>[];
+        };
+
+        inboxNotifications = mapInboxRowsToNotifications(inboxPayload.items, 120);
+        loadedSources += 1;
+      }
+
+      if (!loadedSources) {
         return;
       }
 
-      const payload = (await response.json()) as {
-        items?: Record<string, unknown>[];
-      };
-
-      const notifications = mapHistoryRowsToNotifications(payload.items, currentUserId, 120);
+      const notifications = mergeNotificationEntries([inboxNotifications, historyNotifications], 120);
       const seenStorageKey = `${NOTIFICATION_SEEN_STORAGE_PREFIX}:${currentUserId}`;
 
       const serializedSeen = await SecureStore.getItemAsync(seenStorageKey).catch(() => null);
@@ -123,6 +161,45 @@ export function NotificationBadgeProvider({ children }: { children: React.ReactN
             .map((value) => (typeof value === 'string' ? value.trim() : ''))
             .filter((value) => Boolean(value))
         : [];
+
+      const currentNotificationIdSet = new Set(notifications.map((entry) => entry.id));
+
+      if (!hasHydratedNotificationIdsRef.current) {
+        hasHydratedNotificationIdsRef.current = true;
+        knownNotificationIdsRef.current = currentNotificationIdSet;
+      } else {
+        const freshUnreadEntries = notifications
+          .filter((entry) => !knownNotificationIdsRef.current.has(entry.id))
+          .filter((entry) => !seenIds.includes(entry.id))
+          .slice(0, MAX_FOREGROUND_ALERTS_PER_SYNC);
+
+        if (freshUnreadEntries.length) {
+          const scheduleLocalAlert = async (entry: NotificationEntry) => {
+            await Notifications.scheduleNotificationAsync({
+              content: {
+                title: entry.title,
+                body: entry.subtitle,
+                data: {
+                  type: 'claim_update',
+                  requestId: entry.requestId,
+                  foundItemId: entry.foundItemId,
+                },
+              },
+              trigger: null,
+            });
+          };
+
+          for (const entry of freshUnreadEntries) {
+            try {
+              await scheduleLocalAlert(entry);
+            } catch {
+              break;
+            }
+          }
+        }
+
+        knownNotificationIdsRef.current = currentNotificationIdSet;
+      }
 
       const nextUnreadCount = notifications.filter((entry) => !seenIds.includes(entry.id)).length;
       setUnreadCountState(nextUnreadCount);
@@ -164,6 +241,12 @@ export function NotificationBadgeProvider({ children }: { children: React.ReactN
 
     const registerDevicePushToken = async () => {
       if (!currentUserId) {
+        return;
+      }
+
+      // Expo Go on SDK 53+ no longer supports remote push token registration on Android.
+      // Skip this step in Expo Go to avoid runtime errors during local development.
+      if (isExpoGoRuntime()) {
         return;
       }
 

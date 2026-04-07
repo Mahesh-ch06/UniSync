@@ -26,3 +26,7 @@ Run files in numeric order:
 22. 022_update_profile_summary_in_progress_and_last_activity.sql
 23. 023_fix_user_profiles_rls_claim_mapping.sql
 24. 024_user_profiles_rls_allow_clerk_session_role.sql
+25. 025_fix_user_profile_settings_schema_compat.sql
+26. 026_create_push_device_tokens.sql
+27. 027_add_tutorial_state_to_user_profiles.sql
+28. 028_create_user_notifications.sql

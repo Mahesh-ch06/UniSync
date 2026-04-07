@@ -2,9 +2,9 @@
   "expo": {
     "name": "UniSync",
     "slug": "unisync",
-    "owner": "mahesh0603",
+    "owner": "mahesh06",
     "scheme": "unisync",
-    "version": "1.0.6",
+    "version": "1.0.8",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
@@ -15,7 +15,7 @@
     },
     "ios": {
       "supportsTablet": true,
-      "buildNumber": "1.0.6"
+      "buildNumber": "1.0.8"
     },
     "android": {
       "adaptiveIcon": {
@@ -25,7 +25,7 @@
       "edgeToEdgeEnabled": true,
       "predictiveBackGestureEnabled": false,
       "package": "com.mahesh0603.MobileApp",
-      "versionCode": 6,
+      "versionCode": 8,
       "permissions": [
         "android.permission.POST_NOTIFICATIONS",
         "android.permission.RECORD_AUDIO",
@@ -56,7 +56,7 @@
     ],
     "extra": {
       "eas": {
-        "projectId": "aa032913-0356-40a8-89f6-ee6ccc730f8f"
+        "projectId": "ad810152-606c-40b1-ba87-292f2fc33d16"
       }
     }
   }

@@ -2,6 +2,7 @@ import MaterialIcons from '@expo/vector-icons/MaterialIcons';
 import { useAuth, useUser } from '@clerk/clerk-expo';
 import type { BottomTabNavigationProp } from '@react-navigation/bottom-tabs';
 import { useNavigation } from '@react-navigation/native';
+import Constants from 'expo-constants';
 import * as Location from 'expo-location';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
@@ -9,6 +10,7 @@ import {
   Animated,
   LayoutChangeEvent,
   Linking,
+  Modal,
   Platform,
   Pressable,
   StyleSheet,
@@ -267,6 +269,7 @@ export function MapScreen() {
   const [liveLocation, setLiveLocation] = useState<LiveLocation | null>(null);
   const [distanceToZoneM, setDistanceToZoneM] = useState<number | null>(null);
   const [lastKnownLocation, setLastKnownLocation] = useState<string | null>(null);
+  const [isMapWorkNoticeVisible, setIsMapWorkNoticeVisible] = useState(true);
   const [isTutorialVisible, setIsTutorialVisible] = useState(false);
   const [tutorialStepIndex, setTutorialStepIndex] = useState(0);
   const [tutorialLayouts, setTutorialLayouts] = useState<
@@ -282,6 +285,22 @@ export function MapScreen() {
 
   const currentUserId = readText(user?.id);
   const userCreatedAtMs = useMemo(() => resolveTimestampMs(user?.createdAt), [user?.createdAt]);
+  const androidGoogleMapsKey = useMemo(() => {
+    const fromExpoConfig = readText(Constants?.expoConfig?.android?.config?.googleMaps?.apiKey);
+
+    if (fromExpoConfig) {
+      return fromExpoConfig;
+    }
+
+    const easExtra =
+      Constants?.expoConfig?.extra && typeof Constants.expoConfig.extra === 'object'
+        ? (Constants.expoConfig.extra as Record<string, unknown>)
+        : null;
+
+    return readText(easExtra?.googleMapsApiKey);
+  }, []);
+
+  const canRenderNativeMap = Platform.OS !== 'android' || Boolean(androidGoogleMapsKey) || __DEV__;
   const tutorialSyncOptions = useMemo(
     () => ({
       tutorialKey: MAP_TUTORIAL_STORAGE_KEY,
@@ -462,6 +481,11 @@ export function MapScreen() {
     let timer: ReturnType<typeof setTimeout> | null = null;
 
     const maybeShowTutorial = async () => {
+      if (isMapWorkNoticeVisible) {
+        setIsTutorialVisible(false);
+        return;
+      }
+
       if (!tutorialSyncOptions.userId) {
         setHasTutorialBeenSeen(true);
         setIsTutorialVisible(false);
@@ -501,7 +525,7 @@ export function MapScreen() {
         clearTimeout(timer);
       }
     };
-  }, [tutorialSyncOptions]);
+  }, [isMapWorkNoticeVisible, tutorialSyncOptions]);
 
   useEffect(() => {
     if (!isTutorialVisible || !activeTutorialStep) {
@@ -782,24 +806,36 @@ export function MapScreen() {
     const lat = selectedZone.latitude;
     const lon = selectedZone.longitude;
     const label = encodeURIComponent(selectedZone.name);
-    const url = Platform.select({
-      ios: `maps:0,0?q=${lat},${lon}(${label})`,
-      android: `geo:${lat},${lon}?q=${lat},${lon}(${label})`,
-      default: `https://www.google.com/maps/search/?api=1&query=${lat},${lon}`,
+
+    const candidates = Platform.select({
+      ios: [
+        `maps:0,0?q=${lat},${lon}(${label})`,
+        `https://www.google.com/maps/search/?api=1&query=${lat},${lon}`,
+      ],
+      android: [
+        `geo:${lat},${lon}?q=${lat},${lon}(${label})`,
+        `https://www.google.com/maps/search/?api=1&query=${lat},${lon}`,
+      ],
+      default: [`https://www.google.com/maps/search/?api=1&query=${lat},${lon}`],
     });
 
-    if (!url) {
+    const urls = Array.isArray(candidates) ? candidates : [];
+    if (!urls.length) {
       setMapStatus('Unable to generate a map link on this device.');
       return;
     }
 
-    const canOpen = await Linking.canOpenURL(url);
-    if (!canOpen) {
-      setMapStatus('No map app available to open directions.');
-      return;
+    for (const url of urls) {
+      try {
+        await Linking.openURL(url);
+        setMapStatus('Opened directions in your maps app.');
+        return;
+      } catch {
+        continue;
+      }
     }
 
-    await Linking.openURL(url);
+    setMapStatus('No map app available to open directions.');
   }, [selectedZone.latitude, selectedZone.longitude, selectedZone.name]);
 
   const handleStartRoute = useCallback(() => {
@@ -951,56 +987,68 @@ export function MapScreen() {
       <View style={styles.root}>
         <View onLayout={recordTutorialLayout('map')} style={resolveTutorialSectionStyle('map')}>
           <View style={styles.mapCanvas}>
-            <MapView
-              ref={(ref) => {
-                mapRef.current = ref;
-              }}
-              onRegionChangeComplete={(region) => {
-                setMapRegion(region);
-              }}
-              region={mapRegion}
-              rotateEnabled
-              showsCompass
-              showsMyLocationButton={false}
-              showsUserLocation={livePermissionState === 'granted'}
-              style={styles.mapView}
-            >
-              {DROP_ZONES.map((zone) => {
-                const activeZone = zone.id === selectedZone.id;
+            {canRenderNativeMap ? (
+              <MapView
+                ref={(ref) => {
+                  mapRef.current = ref;
+                }}
+                onRegionChangeComplete={(region) => {
+                  setMapRegion(region);
+                }}
+                region={mapRegion}
+                rotateEnabled
+                showsCompass
+                showsMyLocationButton={false}
+                showsUserLocation={livePermissionState === 'granted'}
+                style={styles.mapView}
+              >
+                {DROP_ZONES.map((zone) => {
+                  const activeZone = zone.id === selectedZone.id;
 
-                return (
-                  <MapMarker
-                    key={zone.id}
-                    coordinate={{
-                      latitude: zone.latitude,
-                      longitude: zone.longitude,
-                    }}
-                    onPress={() => handleSelectZone(zone)}
-                  >
-                    <View style={[styles.mapPinBubble, activeZone ? styles.mapPinBubbleActive : undefined]}>
-                      <MaterialIcons
-                        color={activeZone ? colors.onPrimary : colors.primary}
-                        name="location-on"
-                        size={12}
-                      />
-                      <Text style={[styles.mapPinBubbleText, activeZone ? styles.mapPinBubbleTextActive : undefined]}>
-                        {zone.pinLabel}
-                      </Text>
-                    </View>
-                  </MapMarker>
-                );
-              })}
+                  return (
+                    <MapMarker
+                      key={zone.id}
+                      coordinate={{
+                        latitude: zone.latitude,
+                        longitude: zone.longitude,
+                      }}
+                      onPress={() => handleSelectZone(zone)}
+                    >
+                      <View style={[styles.mapPinBubble, activeZone ? styles.mapPinBubbleActive : undefined]}>
+                        <MaterialIcons
+                          color={activeZone ? colors.onPrimary : colors.primary}
+                          name="location-on"
+                          size={12}
+                        />
+                        <Text
+                          style={[styles.mapPinBubbleText, activeZone ? styles.mapPinBubbleTextActive : undefined]}
+                        >
+                          {zone.pinLabel}
+                        </Text>
+                      </View>
+                    </MapMarker>
+                  );
+                })}
 
-              {routeLineCoordinates.length >= 2 ? (
-                <Polyline
-                  coordinates={routeLineCoordinates}
-                  lineCap="round"
-                  lineJoin="round"
-                  strokeColor={routeState === 'completed' ? colors.success : colors.primary}
-                  strokeWidth={4}
-                />
-              ) : null}
-            </MapView>
+                {routeLineCoordinates.length >= 2 ? (
+                  <Polyline
+                    coordinates={routeLineCoordinates}
+                    lineCap="round"
+                    lineJoin="round"
+                    strokeColor={routeState === 'completed' ? colors.success : colors.primary}
+                    strokeWidth={4}
+                  />
+                ) : null}
+              </MapView>
+            ) : (
+              <View style={styles.mapFallbackCard}>
+                <MaterialIcons color={colors.primary} name="map" size={28} />
+                <Text style={styles.mapFallbackTitle}>Map temporarily unavailable</Text>
+                <Text style={styles.mapFallbackText}>
+                  Add Android Google Maps API key in app config to enable live map rendering.
+                </Text>
+              </View>
+            )}
 
             <View style={styles.livePreviewCard}>
               <View style={styles.livePreviewHeaderRow}>
@@ -1166,6 +1214,30 @@ export function MapScreen() {
         </View>
       </View>
 
+      <Modal
+        animationType="fade"
+        onRequestClose={() => setIsMapWorkNoticeVisible(false)}
+        transparent
+        visible={isMapWorkNoticeVisible}
+      >
+        <View style={styles.mapNoticeBackdrop}>
+          <View style={styles.mapNoticeCard}>
+            <View style={styles.mapNoticeHeaderRow}>
+              <MaterialIcons color={colors.primary} name="construction" size={18} />
+              <Text style={styles.mapNoticeTitle}>Map Feature Update</Text>
+            </View>
+
+            <Text style={styles.mapNoticeDescription}>
+              We are still working on this Map feature. It is currently partially working.
+            </Text>
+
+            <Pressable onPress={() => setIsMapWorkNoticeVisible(false)} style={styles.mapNoticeButton}>
+              <Text style={styles.mapNoticeButtonText}>Got it</Text>
+            </Pressable>
+          </View>
+        </View>
+      </Modal>
+
       {isTutorialVisible && activeTutorialStep ? (
         <View
           pointerEvents="box-none"
@@ -1273,6 +1345,31 @@ const styles = StyleSheet.create({
   },
   mapView: {
     ...StyleSheet.absoluteFillObject,
+  },
+  mapFallbackCard: {
+    alignItems: 'center',
+    backgroundColor: '#F0F4FF',
+    borderColor: '#D4E0FA',
+    borderRadius: radii.md,
+    borderWidth: 1,
+    justifyContent: 'center',
+    margin: 14,
+    paddingHorizontal: 18,
+    paddingVertical: 20,
+  },
+  mapFallbackTitle: {
+    color: colors.primary,
+    fontFamily: fontFamily.headlineSemiBold,
+    fontSize: 16,
+    marginTop: 8,
+  },
+  mapFallbackText: {
+    color: colors.onSurfaceVariant,
+    fontFamily: fontFamily.bodyMedium,
+    fontSize: 12,
+    lineHeight: 17,
+    marginTop: 6,
+    textAlign: 'center',
   },
   mapPinBubble: {
     alignItems: 'center',
@@ -1674,6 +1771,57 @@ const styles = StyleSheet.create({
     fontFamily: fontFamily.headlineBold,
     fontSize: 16,
     marginLeft: 8,
+  },
+  mapNoticeBackdrop: {
+    alignItems: 'center',
+    backgroundColor: 'rgba(8, 12, 24, 0.5)',
+    flex: 1,
+    justifyContent: 'center',
+    paddingHorizontal: 24,
+  },
+  mapNoticeCard: {
+    ...shadows.strong,
+    backgroundColor: colors.surface,
+    borderColor: 'rgba(0, 6, 102, 0.2)',
+    borderRadius: radii.lg,
+    borderWidth: 1,
+    maxWidth: 420,
+    paddingHorizontal: 16,
+    paddingVertical: 16,
+    width: '100%',
+  },
+  mapNoticeHeaderRow: {
+    alignItems: 'center',
+    flexDirection: 'row',
+  },
+  mapNoticeTitle: {
+    color: colors.primary,
+    fontFamily: fontFamily.headlineBold,
+    fontSize: 18,
+    marginLeft: 8,
+  },
+  mapNoticeDescription: {
+    color: colors.onSurfaceVariant,
+    fontFamily: fontFamily.bodyMedium,
+    fontSize: 13,
+    lineHeight: 19,
+    marginTop: 10,
+  },
+  mapNoticeButton: {
+    alignItems: 'center',
+    alignSelf: 'flex-end',
+    backgroundColor: colors.primary,
+    borderRadius: radii.md,
+    marginTop: 14,
+    paddingHorizontal: 14,
+    paddingVertical: 9,
+  },
+  mapNoticeButtonText: {
+    color: colors.onPrimary,
+    fontFamily: fontFamily.bodySemiBold,
+    fontSize: 12,
+    letterSpacing: 0.4,
+    textTransform: 'uppercase',
   },
   tutorialFloatingWrap: {
     left: 14,

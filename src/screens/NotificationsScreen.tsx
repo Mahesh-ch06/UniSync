@@ -18,7 +18,9 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import { AppTopBar } from '../components/AppTopBar';
 import { backendEnv } from '../config/env';
 import {
+  mapInboxRowsToNotifications,
   mapHistoryRowsToNotifications,
+  mergeNotificationEntries,
   NOTIFICATION_SEEN_STORAGE_PREFIX,
   type NotificationEntry,
 } from '../lib/notifications';
@@ -108,7 +110,7 @@ async function fetchWithTimeout(
 export function NotificationsScreen() {
   const { getToken } = useAuth();
   const { user } = useUser();
-  const { requestSync } = useNotificationBadge();
+  const { requestSync, setUnreadCount } = useNotificationBadge();
   const navigation = useNavigation<NavigationProp<NotificationTabNavigationParams>>();
   const getTokenRef = useRef(getToken);
   const currentUserId = readText(user?.id);
@@ -228,18 +230,43 @@ export function NotificationsScreen() {
           return;
         }
 
-        const response = await fetchWithTimeout(`${backendBaseUrl}/api/match-requests/history/me`, {
-          headers: {
-            Authorization: `Bearer ${token}`,
-          },
-        });
+        const [historyResponse, inboxResponse] = await Promise.all([
+          fetchWithTimeout(`${backendBaseUrl}/api/match-requests/history/me`, {
+            headers: {
+              Authorization: `Bearer ${token}`,
+            },
+          }),
+          fetchWithTimeout(`${backendBaseUrl}/api/notifications/inbox/me`, {
+            headers: {
+              Authorization: `Bearer ${token}`,
+            },
+          }),
+        ]);
 
-        if (!response.ok) {
-          throw new Error(`Could not load notifications (${response.status}).`);
+        let loadedSources = 0;
+        let historyNotifications: NotificationEntry[] = [];
+        let inboxNotifications: NotificationEntry[] = [];
+
+        if (historyResponse.ok) {
+          const historyPayload = (await historyResponse.json()) as { items?: Record<string, unknown>[] };
+          historyNotifications = mapHistoryRowsToNotifications(historyPayload.items, currentUserId, 120);
+          loadedSources += 1;
         }
 
-        const payload = (await response.json()) as { items?: Record<string, unknown>[] };
-        setNotifications(mapHistoryRowsToNotifications(payload.items, currentUserId, 80));
+        // Older backend versions may not have this endpoint yet. Treat 404 as non-fatal.
+        if (inboxResponse.ok) {
+          const inboxPayload = (await inboxResponse.json()) as { items?: Record<string, unknown>[] };
+          inboxNotifications = mapInboxRowsToNotifications(inboxPayload.items, 120);
+          loadedSources += 1;
+        } else if (inboxResponse.status !== 404) {
+          throw new Error(`Could not load notifications inbox (${inboxResponse.status}).`);
+        }
+
+        if (!loadedSources) {
+          throw new Error(`Could not load notifications (${historyResponse.status}).`);
+        }
+
+        setNotifications(mergeNotificationEntries([inboxNotifications, historyNotifications], 120));
         requestSync();
       } catch (error) {
         const message =
@@ -295,9 +322,18 @@ export function NotificationsScreen() {
     [notificationRows],
   );
 
+  useEffect(() => {
+    setUnreadCount(unreadCount);
+  }, [setUnreadCount, unreadCount]);
+
   const handleOpenNotification = useCallback(
     (entry: NotificationRow) => {
       markAsSeen([entry.id]);
+
+      if (!entry.requestId) {
+        return;
+      }
+
       navigation.navigate('History', {
         focusRequestId: entry.requestId,
         focusFoundItemId: entry.foundItemId,
@@ -409,7 +445,9 @@ export function NotificationsScreen() {
                   </View>
 
                   <Text style={styles.cardSubtitle}>{entry.subtitle}</Text>
-                  <Text style={styles.cardActionLabel}>Open in History</Text>
+                  <Text style={styles.cardActionLabel}>
+                    {entry.requestId ? 'Open in History' : 'Mark as read'}
+                  </Text>
                 </View>
               </Pressable>
             ))

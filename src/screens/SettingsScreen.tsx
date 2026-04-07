@@ -1,5 +1,6 @@
 import MaterialIcons from '@expo/vector-icons/MaterialIcons';
 import { useAuth, useUser } from '@clerk/clerk-expo';
+import Constants from 'expo-constants';
 import { BottomTabNavigationProp } from '@react-navigation/bottom-tabs';
 import { useNavigation } from '@react-navigation/native';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
@@ -200,6 +201,19 @@ export function SettingsScreen() {
   const userPrimaryEmail = useMemo(() => {
     return user?.primaryEmailAddress?.emailAddress || user?.emailAddresses?.[0]?.emailAddress || '';
   }, [user]);
+
+  const appVersionLabel = useMemo(() => {
+    const configuredVersion = readText(Constants.expoConfig?.version);
+    const nativeVersion = readText(Constants.nativeAppVersion);
+    const nativeBuildVersion = readText(Constants.nativeBuildVersion);
+
+    const baseVersion = configuredVersion || nativeVersion || 'Unknown';
+    if (nativeBuildVersion && nativeBuildVersion !== baseVersion) {
+      return `${baseVersion} (${nativeBuildVersion})`;
+    }
+
+    return baseVersion;
+  }, []);
 
   const hasAdminAccess = useMemo(() => isAdminEmail(userPrimaryEmail), [userPrimaryEmail]);
 
@@ -612,6 +626,12 @@ export function SettingsScreen() {
                 <MaterialIcons color={colors.primary} name="fingerprint" size={18} />
                 <Text numberOfLines={1} style={styles.accountText}>
                   {userId || 'No member id found'}
+                </Text>
+              </View>
+              <View style={styles.accountRow}>
+                <MaterialIcons color={colors.primary} name="new-releases" size={18} />
+                <Text numberOfLines={1} style={styles.accountText}>
+                  App version {appVersionLabel}
                 </Text>
               </View>
 

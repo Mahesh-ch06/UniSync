@@ -26,6 +26,7 @@ const geminiModel = readText(process.env.GEMINI_MODEL) || 'gemini-1.5-flash';
 const PICKUP_EDIT_WINDOW_MS = 5 * 60 * 1000;
 const MESSAGE_TABLE_NAME = 'match_request_messages';
 const PUSH_DEVICE_TOKEN_TABLE = 'push_device_tokens';
+const USER_NOTIFICATION_TABLE = 'user_notifications';
 const TUTORIAL_STATE_COLUMN = 'tutorial_state';
 const EXPO_PUSH_API_URL = 'https://exp.host/--/api/v2/push/send';
 const ADMIN_EMAIL_ALLOWLIST = new Set(['chitikeshimahesh6@gmail.com']);
@@ -663,6 +664,47 @@ async function sendPushToUsersSafely({ userIds, title, body, data, preferenceCol
     console.warn('Push notification send skipped', error);
     return { sent: 0, attempted: 0, recipients: 0 };
   }
+}
+
+async function persistUserNotificationsSafely({ userIds, type, title, body, data, requestId, foundItemId }) {
+  const normalizedUserIds = Array.from(new Set(userIds.map((value) => readText(value)).filter(Boolean)));
+
+  if (!normalizedUserIds.length) {
+    return {
+      stored: 0,
+      storageReady: true,
+    };
+  }
+
+  const createdAt = new Date().toISOString();
+  const rows = normalizedUserIds.map((userId) => ({
+    user_id: userId,
+    type: readText(type) || 'general',
+    title: readText(title) || 'UniSync update',
+    body: readText(body) || 'You have a new update.',
+    data: data && typeof data === 'object' ? data : {},
+    request_id: readText(requestId) || null,
+    found_item_id: readText(foundItemId) || null,
+    created_at: createdAt,
+  }));
+
+  const { error } = await supabase.from(USER_NOTIFICATION_TABLE).insert(rows);
+
+  if (error) {
+    if (isMissingSchemaError(error)) {
+      return {
+        stored: 0,
+        storageReady: false,
+      };
+    }
+
+    throw error;
+  }
+
+  return {
+    stored: rows.length,
+    storageReady: true,
+  };
 }
 
 function classifyItemFromSignals({ hintText, fileName, width, height, preferredLabel, preferredCategory }) {
@@ -2393,6 +2435,17 @@ app.post('/api/admin/notifications/broadcast', requireClerkAuth, requireAdminAcc
       );
     }
 
+    const persistence = await persistUserNotificationsSafely({
+      userIds: recipientIds,
+      type: 'admin_broadcast',
+      title,
+      body: message,
+      data: {
+        type: 'admin_broadcast',
+        sentBy: 'admin',
+      },
+    });
+
     const delivery = await sendPushToUsersSafely({
       userIds: recipientIds,
       title,
@@ -2407,6 +2460,8 @@ app.post('/api/admin/notifications/broadcast', requireClerkAuth, requireAdminAcc
       sent: delivery.sent,
       attempted: delivery.attempted,
       recipients: delivery.recipients,
+      stored: persistence.stored,
+      storageReady: persistence.storageReady,
       targetMode: targetUserId ? 'single' : 'broadcast',
     });
   } catch (error) {
@@ -2830,6 +2885,39 @@ app.post('/api/match-requests', requireClerkAuth, async (req, res) => {
   } catch (error) {
     res.status(500).json({
       error: 'Failed to submit claim request.',
+      details: error && typeof error === 'object' && 'message' in error ? error.message : null,
+    });
+  }
+});
+
+app.get('/api/notifications/inbox/me', requireClerkAuth, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from(USER_NOTIFICATION_TABLE)
+      .select('id,user_id,type,title,body,data,request_id,found_item_id,created_at')
+      .eq('user_id', req.auth.userId)
+      .order('created_at', { ascending: false })
+      .limit(120);
+
+    if (error) {
+      if (isMissingSchemaError(error)) {
+        res.json({
+          items: [],
+          storageReady: false,
+        });
+        return;
+      }
+
+      throw error;
+    }
+
+    res.json({
+      items: data ?? [],
+      storageReady: true,
+    });
+  } catch (error) {
+    res.status(500).json({
+      error: 'Failed to fetch notifications inbox.',
       details: error && typeof error === 'object' && 'message' in error ? error.message : null,
     });
   }

@@ -36,6 +36,14 @@ function parseTimestamp(...rawValues: unknown[]): number {
   return Date.now();
 }
 
+function readPlainObject(value: unknown): Record<string, unknown> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return {};
+  }
+
+  return value as Record<string, unknown>;
+}
+
 export function mapHistoryRowToNotification(
   row: Record<string, unknown>,
   currentUserId: string,
@@ -221,4 +229,93 @@ export function mapHistoryRowsToNotifications(
   mapped.sort((left, right) => right.timestampMs - left.timestampMs);
 
   return mapped.slice(0, Math.max(1, limit));
+}
+
+export function mapInboxRowToNotification(row: Record<string, unknown>): NotificationEntry | null {
+  const id = readText(row.id);
+  const type = readText(row.type).toLowerCase();
+  const title = readText(row.title) || 'UniSync update';
+  const subtitle = readText(row.body || row.message) || 'You have a new notification.';
+
+  if (!id) {
+    return null;
+  }
+
+  const payload = readPlainObject(row.data);
+  const requestId =
+    readText(row.request_id) ||
+    readText(payload.requestId) ||
+    readText(payload.request_id);
+  const foundItemId =
+    readText(row.found_item_id) ||
+    readText(payload.foundItemId) ||
+    readText(payload.found_item_id);
+
+  const timestampMs = parseTimestamp(row.created_at, payload.created_at, payload.timestamp);
+
+  if (type === 'admin_broadcast') {
+    return {
+      id,
+      requestId,
+      foundItemId,
+      title,
+      subtitle,
+      timestampMs,
+      icon: 'campaign',
+      iconColor: colors.primaryContainer,
+      iconBackground: '#EAF0FF',
+      autoOpenMessages: false,
+    };
+  }
+
+  return {
+    id,
+    requestId,
+    foundItemId,
+    title,
+    subtitle,
+    timestampMs,
+    icon: 'notifications-active',
+    iconColor: colors.primaryContainer,
+    iconBackground: '#EAF0FF',
+    autoOpenMessages: Boolean(requestId),
+  };
+}
+
+export function mapInboxRowsToNotifications(
+  rows: Record<string, unknown>[] | undefined,
+  limit: number = 80,
+): NotificationEntry[] {
+  if (!Array.isArray(rows)) {
+    return [];
+  }
+
+  const mapped = rows
+    .map((row) => mapInboxRowToNotification(row))
+    .filter((entry): entry is NotificationEntry => Boolean(entry));
+
+  mapped.sort((left, right) => right.timestampMs - left.timestampMs);
+
+  return mapped.slice(0, Math.max(1, limit));
+}
+
+export function mergeNotificationEntries(
+  streams: Array<NotificationEntry[] | undefined>,
+  limit: number = 120,
+): NotificationEntry[] {
+  const byId = new Map<string, NotificationEntry>();
+
+  streams.forEach((stream) => {
+    (stream ?? []).forEach((entry) => {
+      const existing = byId.get(entry.id);
+
+      if (!existing || entry.timestampMs > existing.timestampMs) {
+        byId.set(entry.id, entry);
+      }
+    });
+  });
+
+  return Array.from(byId.values())
+    .sort((left, right) => right.timestampMs - left.timestampMs)
+    .slice(0, Math.max(1, limit));
 }
