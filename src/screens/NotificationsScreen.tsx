@@ -1,7 +1,7 @@
 import MaterialIcons from '@expo/vector-icons/MaterialIcons';
 import { useAuth } from '@clerk/clerk-expo';
 import { useUser } from '@clerk/clerk-expo';
-import { NavigationProp, useNavigation } from '@react-navigation/native';
+import { NavigationProp, useFocusEffect, useNavigation } from '@react-navigation/native';
 import * as SecureStore from 'expo-secure-store';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
@@ -26,6 +26,7 @@ import { useNotificationBadge } from '../lib/notificationBadge';
 import { colors, fontFamily, radii, shadows } from '../theme/tokens';
 
 const REQUEST_TIMEOUT_MS = 15000;
+const REALTIME_REFRESH_MS = 10000;
 
 type HistoryRouteParams = {
   focusRequestId?: string;
@@ -107,7 +108,7 @@ async function fetchWithTimeout(
 export function NotificationsScreen() {
   const { getToken } = useAuth();
   const { user } = useUser();
-  const { setUnreadCount } = useNotificationBadge();
+  const { requestSync } = useNotificationBadge();
   const navigation = useNavigation<NavigationProp<NotificationTabNavigationParams>>();
   const getTokenRef = useRef(getToken);
   const currentUserId = readText(user?.id);
@@ -178,15 +179,22 @@ export function NotificationsScreen() {
         const merged = Array.from(new Set([...previous, ...validIds])).slice(-240);
 
         if (seenStorageKey) {
-          void SecureStore.setItemAsync(seenStorageKey, JSON.stringify(merged)).catch(() => {
-            return;
-          });
+          void SecureStore
+            .setItemAsync(seenStorageKey, JSON.stringify(merged))
+            .then(() => {
+              requestSync();
+            })
+            .catch(() => {
+              requestSync();
+            });
+        } else {
+          requestSync();
         }
 
         return merged;
       });
     },
-    [seenStorageKey],
+    [requestSync, seenStorageKey],
   );
 
   const loadNotifications = useCallback(
@@ -232,6 +240,7 @@ export function NotificationsScreen() {
 
         const payload = (await response.json()) as { items?: Record<string, unknown>[] };
         setNotifications(mapHistoryRowsToNotifications(payload.items, currentUserId, 80));
+        requestSync();
       } catch (error) {
         const message =
           typeof error === 'object' &&
@@ -249,12 +258,24 @@ export function NotificationsScreen() {
         }
       }
     },
-    [currentUserId],
+    [currentUserId, requestSync],
   );
 
   useEffect(() => {
     void loadNotifications();
   }, [loadNotifications]);
+
+  useFocusEffect(
+    useCallback(() => {
+      const intervalId = setInterval(() => {
+        void loadNotifications({ soft: true });
+      }, REALTIME_REFRESH_MS);
+
+      return () => {
+        clearInterval(intervalId);
+      };
+    }, [loadNotifications]),
+  );
 
   const handleRefresh = useCallback(async () => {
     setIsRefreshing(true);
@@ -273,10 +294,6 @@ export function NotificationsScreen() {
     () => notificationRows.filter((entry) => entry.unread).length,
     [notificationRows],
   );
-
-  useEffect(() => {
-    setUnreadCount(unreadCount);
-  }, [setUnreadCount, unreadCount]);
 
   const handleOpenNotification = useCallback(
     (entry: NotificationRow) => {

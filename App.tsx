@@ -38,6 +38,7 @@ import { NotificationsScreen } from './src/screens/NotificationsScreen';
 import { ProfileScreen } from './src/screens/ProfileScreen';
 import { ReportScreen } from './src/screens/ReportScreen';
 import { SettingsScreen } from './src/screens/SettingsScreen';
+import { AdminScreen } from './src/screens/AdminScreen';
 import { CompleteNameScreen } from './src/screens/CompleteNameScreen';
 import { SetupScreen } from './src/screens/SetupScreen';
 import { colors, fontFamily } from './src/theme/tokens';
@@ -55,6 +56,7 @@ type RootTabsParamList = {
   Profile: undefined;
   Notifications: undefined;
   Settings: undefined;
+  Admin: undefined;
 };
 
 const Tab = createBottomTabNavigator<RootTabsParamList>();
@@ -67,6 +69,7 @@ const tabIcons: Record<keyof RootTabsParamList, keyof typeof MaterialIcons.glyph
   Profile: 'person',
   Notifications: 'notifications-none',
   Settings: 'settings',
+  Admin: 'admin-panel-settings',
 };
 
 const tabLabels: Record<keyof RootTabsParamList, string> = {
@@ -77,6 +80,7 @@ const tabLabels: Record<keyof RootTabsParamList, string> = {
   Profile: 'Profile',
   Notifications: 'Notifications',
   Settings: 'Settings',
+  Admin: 'Admin',
 };
 
 const navigationTheme = {
@@ -191,6 +195,15 @@ function AppTabsNavigator() {
       <Tab.Screen
         component={SettingsScreen}
         name="Settings"
+        options={{
+          tabBarButton: () => null,
+          tabBarItemStyle: { display: 'none' },
+          tabBarStyle: { display: 'none' },
+        }}
+      />
+      <Tab.Screen
+        component={AdminScreen}
+        name="Admin"
         options={{
           tabBarButton: () => null,
           tabBarItemStyle: { display: 'none' },

@@ -25,9 +25,17 @@ const geminiApiKey = readText(process.env.GEMINI_API_KEY);
 const geminiModel = readText(process.env.GEMINI_MODEL) || 'gemini-1.5-flash';
 const PICKUP_EDIT_WINDOW_MS = 5 * 60 * 1000;
 const MESSAGE_TABLE_NAME = 'match_request_messages';
+const PUSH_DEVICE_TOKEN_TABLE = 'push_device_tokens';
+const TUTORIAL_STATE_COLUMN = 'tutorial_state';
+const EXPO_PUSH_API_URL = 'https://exp.host/--/api/v2/push/send';
+const ADMIN_EMAIL_ALLOWLIST = new Set(['chitikeshimahesh6@gmail.com']);
+const ADMIN_CACHE_TTL_MS = 5 * 60 * 1000;
+const TUTORIAL_ELIGIBILITY_CACHE_TTL_MS = 5 * 60 * 1000;
 const inMemoryMatchRequestMessages = new Map();
+const adminEmailCache = new Map();
+const tutorialEligibilityCache = new Map();
 const USER_PROFILE_SCHEMA_GUIDE =
-  'Run SQL migrations 020_create_user_profiles_and_summary.sql, 022_update_profile_summary_in_progress_and_last_activity.sql, 023_fix_user_profiles_rls_claim_mapping.sql, 024_user_profiles_rls_allow_clerk_session_role.sql, and 025_fix_user_profile_settings_schema_compat.sql.';
+  'Run SQL migrations 020_create_user_profiles_and_summary.sql, 022_update_profile_summary_in_progress_and_last_activity.sql, 023_fix_user_profiles_rls_claim_mapping.sql, 024_user_profiles_rls_allow_clerk_session_role.sql, 025_fix_user_profile_settings_schema_compat.sql, 026_create_push_device_tokens.sql, and 027_add_tutorial_state_to_user_profiles.sql.';
 
 if (!supabaseUrl || !serviceRoleKey) {
   throw new Error(
@@ -215,6 +223,446 @@ function relationObject(value) {
   }
 
   return null;
+}
+
+function readPlainObject(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return {};
+  }
+
+  return value;
+}
+
+function normalizeTutorialState(value) {
+  const source = readPlainObject(value);
+  const normalized = {};
+
+  Object.entries(source).forEach(([key, entryValue]) => {
+    const normalizedKey = readText(key);
+
+    if (!normalizedKey) {
+      return;
+    }
+
+    if (typeof entryValue === 'boolean') {
+      normalized[normalizedKey] = entryValue;
+      return;
+    }
+
+    if (typeof entryValue === 'string') {
+      const lowered = readText(entryValue).toLowerCase();
+      if (lowered === 'true') {
+        normalized[normalizedKey] = true;
+      } else if (lowered === 'false') {
+        normalized[normalizedKey] = false;
+      }
+    }
+  });
+
+  return normalized;
+}
+
+function readClientCreatedAtMs(value) {
+  const parsed = readNumber(value);
+
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return 0;
+  }
+
+  return Math.round(parsed);
+}
+
+function normalizeTutorialKey(value) {
+  const key = readText(value);
+
+  if (!key) {
+    return '';
+  }
+
+  if (!/^[a-z0-9][a-z0-9._:-]{1,95}$/i.test(key)) {
+    return '';
+  }
+
+  return key;
+}
+
+async function resolveReturningUserStatus(userId, clientCreatedAtMs) {
+  const normalizedUserId = readText(userId);
+
+  if (!normalizedUserId) {
+    return true;
+  }
+
+  const cached = tutorialEligibilityCache.get(normalizedUserId);
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.returning;
+  }
+
+  let returning = true;
+
+  if (clerkSecretKey) {
+    try {
+      const response = await fetch(
+        `https://api.clerk.com/v1/users/${encodeURIComponent(normalizedUserId)}`,
+        {
+          headers: {
+            Authorization: `Bearer ${clerkSecretKey}`,
+          },
+        },
+      );
+
+      if (response.ok) {
+        const payload = await response.json();
+        const createdAtMs = readClientCreatedAtMs(payload?.created_at);
+        const lastSignInAtMs = readClientCreatedAtMs(payload?.last_sign_in_at);
+
+        if (createdAtMs > 0 && lastSignInAtMs > 0) {
+          returning = lastSignInAtMs - createdAtMs > 90 * 1000;
+        } else if (createdAtMs > 0) {
+          returning = Date.now() - createdAtMs > 20 * 60 * 1000;
+        } else if (clientCreatedAtMs > 0) {
+          returning = Date.now() - clientCreatedAtMs > 20 * 60 * 1000;
+        }
+      } else if (clientCreatedAtMs > 0) {
+        returning = Date.now() - clientCreatedAtMs > 20 * 60 * 1000;
+      }
+    } catch {
+      if (clientCreatedAtMs > 0) {
+        returning = Date.now() - clientCreatedAtMs > 20 * 60 * 1000;
+      }
+    }
+  } else if (clientCreatedAtMs > 0) {
+    returning = Date.now() - clientCreatedAtMs > 20 * 60 * 1000;
+  }
+
+  tutorialEligibilityCache.set(normalizedUserId, {
+    returning,
+    expiresAt: Date.now() + TUTORIAL_ELIGIBILITY_CACHE_TTL_MS,
+  });
+
+  return returning;
+}
+
+function readEmailFromClaims(claims) {
+  if (!claims || typeof claims !== 'object') {
+    return '';
+  }
+
+  const directEmail = [
+    readText(claims.email),
+    readText(claims.email_address),
+    readText(claims.primary_email_address),
+  ].find(Boolean);
+
+  if (directEmail) {
+    return directEmail.toLowerCase();
+  }
+
+  if (Array.isArray(claims.email_addresses)) {
+    for (const entry of claims.email_addresses) {
+      if (!entry || typeof entry !== 'object') {
+        continue;
+      }
+
+      const candidate =
+        readText(entry.email_address) ||
+        readText(entry.emailAddress) ||
+        readText(entry.value) ||
+        readText(entry.address);
+
+      if (candidate) {
+        return candidate.toLowerCase();
+      }
+    }
+  }
+
+  return '';
+}
+
+async function resolveUserPrimaryEmail(userId, sessionClaims) {
+  const normalizedUserId = readText(userId);
+  if (!normalizedUserId) {
+    return '';
+  }
+
+  const claimEmail = readEmailFromClaims(sessionClaims);
+  if (claimEmail) {
+    return claimEmail;
+  }
+
+  const cached = adminEmailCache.get(normalizedUserId);
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.email;
+  }
+
+  if (!clerkSecretKey) {
+    return '';
+  }
+
+  try {
+    const response = await fetch(
+      `https://api.clerk.com/v1/users/${encodeURIComponent(normalizedUserId)}`,
+      {
+        headers: {
+          Authorization: `Bearer ${clerkSecretKey}`,
+        },
+      },
+    );
+
+    if (!response.ok) {
+      return '';
+    }
+
+    const payload = await response.json();
+    const primaryEmailId = readText(payload.primary_email_address_id);
+
+    let resolvedEmail = '';
+    if (Array.isArray(payload.email_addresses)) {
+      for (const row of payload.email_addresses) {
+        if (!row || typeof row !== 'object') {
+          continue;
+        }
+
+        const rowId = readText(row.id);
+        const rowEmail = readText(row.email_address).toLowerCase();
+
+        if (!rowEmail) {
+          continue;
+        }
+
+        if (!resolvedEmail) {
+          resolvedEmail = rowEmail;
+        }
+
+        if (primaryEmailId && rowId === primaryEmailId) {
+          resolvedEmail = rowEmail;
+          break;
+        }
+      }
+    }
+
+    if (resolvedEmail) {
+      adminEmailCache.set(normalizedUserId, {
+        email: resolvedEmail,
+        expiresAt: Date.now() + ADMIN_CACHE_TTL_MS,
+      });
+    }
+
+    return resolvedEmail;
+  } catch {
+    return '';
+  }
+}
+
+function normalizeExpoPushToken(value) {
+  const token = readText(value);
+  if (!token) {
+    return '';
+  }
+
+  if (!token.startsWith('ExponentPushToken[') && !token.startsWith('ExpoPushToken[')) {
+    return '';
+  }
+
+  return token;
+}
+
+function chunkArray(items, chunkSize) {
+  const size = Math.max(1, Math.floor(chunkSize));
+  const chunks = [];
+
+  for (let index = 0; index < items.length; index += size) {
+    chunks.push(items.slice(index, index + size));
+  }
+
+  return chunks;
+}
+
+async function markPushTokensInactive(tokens, reason) {
+  const uniqueTokens = Array.from(new Set(tokens.map((value) => normalizeExpoPushToken(value)).filter(Boolean)));
+
+  if (!uniqueTokens.length) {
+    return;
+  }
+
+  const { error } = await supabase
+    .from(PUSH_DEVICE_TOKEN_TABLE)
+    .update({
+      is_active: false,
+      last_error: readText(reason) || 'disabled',
+      updated_at: new Date().toISOString(),
+    })
+    .in('expo_push_token', uniqueTokens);
+
+  if (error && !isMissingSchemaError(error)) {
+    console.warn('Failed to mark push tokens inactive', error);
+  }
+}
+
+async function sendExpoPushMessages(messages) {
+  if (!Array.isArray(messages) || !messages.length) {
+    return { sent: 0, attempted: 0 };
+  }
+
+  let sent = 0;
+  const attempted = messages.length;
+  const invalidTokens = [];
+
+  for (const batch of chunkArray(messages, 100)) {
+    try {
+      const response = await fetch(EXPO_PUSH_API_URL, {
+        method: 'POST',
+        headers: {
+          Accept: 'application/json',
+          'Accept-encoding': 'gzip, deflate',
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(batch),
+      });
+
+      if (!response.ok) {
+        continue;
+      }
+
+      const payload = await response.json().catch(() => null);
+      const tickets = Array.isArray(payload?.data)
+        ? payload.data
+        : payload?.data
+          ? [payload.data]
+          : [];
+
+      tickets.forEach((ticket, index) => {
+        if (ticket?.status === 'ok') {
+          sent += 1;
+          return;
+        }
+
+        if (ticket?.status === 'error') {
+          const reason = readText(ticket?.details?.error).toLowerCase();
+          if (reason === 'devicenotregistered' || reason === 'invalidtoken') {
+            const token = normalizeExpoPushToken(batch[index]?.to);
+            if (token) {
+              invalidTokens.push(token);
+            }
+          }
+        }
+      });
+    } catch {
+      continue;
+    }
+  }
+
+  if (invalidTokens.length) {
+    await markPushTokensInactive(invalidTokens, 'DeviceNotRegistered');
+  }
+
+  return {
+    sent,
+    attempted,
+  };
+}
+
+async function filterUserIdsByPreference(userIds, preferenceColumn) {
+  const normalizedUserIds = Array.from(new Set(userIds.map((value) => readText(value)).filter(Boolean)));
+
+  if (!normalizedUserIds.length || !preferenceColumn) {
+    return normalizedUserIds;
+  }
+
+  const { data, error } = await supabase
+    .from('user_profiles')
+    .select(`user_id, ${preferenceColumn}`)
+    .in('user_id', normalizedUserIds);
+
+  if (error) {
+    if (isMissingSchemaError(error)) {
+      return normalizedUserIds;
+    }
+
+    throw error;
+  }
+
+  const optInMap = new Map();
+  (data ?? []).forEach((row) => {
+    const userId = readText(row.user_id);
+    if (!userId) {
+      return;
+    }
+
+    optInMap.set(userId, readBoolean(row[preferenceColumn], true));
+  });
+
+  return normalizedUserIds.filter((userId) => {
+    if (!optInMap.has(userId)) {
+      return true;
+    }
+
+    return Boolean(optInMap.get(userId));
+  });
+}
+
+async function sendPushToUsersSafely({ userIds, title, body, data, preferenceColumn }) {
+  const normalizedIds = Array.from(new Set(userIds.map((value) => readText(value)).filter(Boolean)));
+
+  if (!normalizedIds.length) {
+    return { sent: 0, attempted: 0, recipients: 0 };
+  }
+
+  try {
+    const optedInUserIds = await filterUserIdsByPreference(normalizedIds, preferenceColumn);
+
+    if (!optedInUserIds.length) {
+      return { sent: 0, attempted: 0, recipients: 0 };
+    }
+
+    const { data: rows, error } = await supabase
+      .from(PUSH_DEVICE_TOKEN_TABLE)
+      .select('user_id, expo_push_token')
+      .in('user_id', optedInUserIds)
+      .eq('is_active', true)
+      .limit(3000);
+
+    if (error) {
+      if (isMissingSchemaError(error)) {
+        return { sent: 0, attempted: 0, recipients: 0 };
+      }
+
+      throw error;
+    }
+
+    const messages = (rows ?? [])
+      .map((row) => {
+        const token = normalizeExpoPushToken(row.expo_push_token);
+
+        if (!token) {
+          return null;
+        }
+
+        return {
+          to: token,
+          sound: 'default',
+          title: readText(title) || 'UniSync Update',
+          body: readText(body) || 'You have a new update.',
+          data: {
+            ...(data && typeof data === 'object' ? data : {}),
+          },
+        };
+      })
+      .filter(Boolean);
+
+    if (!messages.length) {
+      return { sent: 0, attempted: 0, recipients: 0 };
+    }
+
+    const delivery = await sendExpoPushMessages(messages);
+    return {
+      ...delivery,
+      recipients: optedInUserIds.length,
+    };
+  } catch (error) {
+    console.warn('Push notification send skipped', error);
+    return { sent: 0, attempted: 0, recipients: 0 };
+  }
 }
 
 function classifyItemFromSignals({ hintText, fileName, width, height, preferredLabel, preferredCategory }) {
@@ -802,10 +1250,35 @@ async function requireClerkAuth(req, res, next) {
     req.auth = {
       userId: payload.sub,
       sessionId: payload.sid,
+      sessionClaims: payload,
+      email: readEmailFromClaims(payload),
     };
     next();
   } catch (error) {
     res.status(401).json({ error: 'Invalid auth token.' });
+  }
+}
+
+async function requireAdminAccess(req, res, next) {
+  try {
+    const userId = readText(req.auth?.userId);
+
+    if (!userId) {
+      res.status(401).json({ error: 'Unauthorized.' });
+      return;
+    }
+
+    const resolvedEmail = await resolveUserPrimaryEmail(userId, req.auth?.sessionClaims);
+
+    if (!resolvedEmail || !ADMIN_EMAIL_ALLOWLIST.has(resolvedEmail)) {
+      res.status(403).json({ error: 'Admin access denied for this account.' });
+      return;
+    }
+
+    req.auth.adminEmail = resolvedEmail;
+    next();
+  } catch {
+    res.status(403).json({ error: 'Admin access validation failed.' });
   }
 }
 
@@ -815,6 +1288,98 @@ app.get('/health', (_req, res) => {
     service: 'unisync-backend',
     timestamp: new Date().toISOString(),
   });
+});
+
+app.post('/api/push/register-device', requireClerkAuth, async (req, res) => {
+  const expoPushToken = normalizeExpoPushToken(req.body?.expo_push_token || req.body?.token);
+
+  if (!expoPushToken) {
+    res.status(400).json({ error: 'Valid expo_push_token is required.' });
+    return;
+  }
+
+  const rawPlatform = readText(req.body?.platform).toLowerCase();
+  const platform = rawPlatform === 'ios' || rawPlatform === 'android' ? rawPlatform : 'unknown';
+
+  try {
+    const payload = {
+      user_id: req.auth.userId,
+      expo_push_token: expoPushToken,
+      platform,
+      device_label: readText(req.body?.device_label) || null,
+      app_version: readText(req.body?.app_version) || null,
+      is_active: true,
+      last_error: null,
+      updated_at: new Date().toISOString(),
+    };
+
+    const { data, error } = await supabase
+      .from(PUSH_DEVICE_TOKEN_TABLE)
+      .upsert(payload, { onConflict: 'user_id,expo_push_token' })
+      .select('id,user_id,expo_push_token,platform,is_active,updated_at')
+      .maybeSingle();
+
+    if (error) {
+      if (isMissingSchemaError(error)) {
+        res.status(500).json({
+          error:
+            'Push device token table is missing. Run SQL migration 026_create_push_device_tokens.sql.',
+        });
+        return;
+      }
+
+      throw error;
+    }
+
+    res.status(201).json({
+      registered: true,
+      device: data ?? payload,
+    });
+  } catch (error) {
+    res.status(500).json({
+      error: 'Failed to register push device.',
+      details: error && typeof error === 'object' && 'message' in error ? error.message : null,
+    });
+  }
+});
+
+app.post('/api/push/unregister-device', requireClerkAuth, async (req, res) => {
+  const expoPushToken = normalizeExpoPushToken(req.body?.expo_push_token || req.body?.token);
+
+  try {
+    let query = supabase
+      .from(PUSH_DEVICE_TOKEN_TABLE)
+      .update({
+        is_active: false,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('user_id', req.auth.userId);
+
+    if (expoPushToken) {
+      query = query.eq('expo_push_token', expoPushToken);
+    }
+
+    const { error } = await query;
+
+    if (error) {
+      if (isMissingSchemaError(error)) {
+        res.status(500).json({
+          error:
+            'Push device token table is missing. Run SQL migration 026_create_push_device_tokens.sql.',
+        });
+        return;
+      }
+
+      throw error;
+    }
+
+    res.json({ unregistered: true });
+  } catch (error) {
+    res.status(500).json({
+      error: 'Failed to unregister push device.',
+      details: error && typeof error === 'object' && 'message' in error ? error.message : null,
+    });
+  }
 });
 
 app.get('/api/found-items', async (req, res) => {
@@ -1336,6 +1901,522 @@ app.put('/api/settings/me', requireClerkAuth, async (req, res) => {
   }
 });
 
+app.get('/api/tutorials/me/:tutorialKey', requireClerkAuth, async (req, res) => {
+  const tutorialKey = normalizeTutorialKey(req.params?.tutorialKey);
+
+  if (!tutorialKey) {
+    res.status(400).json({ error: 'tutorialKey is invalid.' });
+    return;
+  }
+
+  const clientCreatedAtMs = readClientCreatedAtMs(req.query?.client_user_created_at);
+
+  try {
+    const { data, error } = await supabase
+      .from('user_profiles')
+      .select(`user_id, ${TUTORIAL_STATE_COLUMN}`)
+      .eq('user_id', req.auth.userId)
+      .maybeSingle();
+
+    if (error) {
+      if (isMissingSchemaError(error)) {
+        res.status(500).json({
+          error: `Profile schema is out of date. ${USER_PROFILE_SCHEMA_GUIDE}`,
+        });
+        return;
+      }
+
+      throw error;
+    }
+
+    const tutorialState = normalizeTutorialState(data?.[TUTORIAL_STATE_COLUMN]);
+
+    if (typeof tutorialState[tutorialKey] === 'boolean') {
+      const seen = Boolean(tutorialState[tutorialKey]);
+
+      res.json({
+        tutorialKey,
+        seen,
+        shouldShow: !seen,
+        source: 'stored',
+      });
+      return;
+    }
+
+    const returningUser = await resolveReturningUserStatus(req.auth.userId, clientCreatedAtMs);
+    const inferredSeen = Boolean(returningUser);
+    const nextTutorialState = {
+      ...tutorialState,
+      [tutorialKey]: inferredSeen,
+    };
+
+    const { error: persistError } = await supabase
+      .from('user_profiles')
+      .upsert(
+        {
+          user_id: req.auth.userId,
+          [TUTORIAL_STATE_COLUMN]: nextTutorialState,
+        },
+        { onConflict: 'user_id' },
+      );
+
+    if (persistError) {
+      if (isMissingSchemaError(persistError)) {
+        res.status(500).json({
+          error: `Profile schema is out of date. ${USER_PROFILE_SCHEMA_GUIDE}`,
+        });
+        return;
+      }
+
+      throw persistError;
+    }
+
+    res.json({
+      tutorialKey,
+      seen: inferredSeen,
+      shouldShow: !inferredSeen,
+      source: inferredSeen ? 'inferred-returning-user' : 'inferred-first-login',
+    });
+  } catch (error) {
+    res.status(500).json({
+      error: 'Failed to fetch tutorial state.',
+      details: error && typeof error === 'object' && 'message' in error ? error.message : null,
+    });
+  }
+});
+
+app.put('/api/tutorials/me/:tutorialKey', requireClerkAuth, async (req, res) => {
+  const tutorialKey = normalizeTutorialKey(req.params?.tutorialKey);
+
+  if (!tutorialKey) {
+    res.status(400).json({ error: 'tutorialKey is invalid.' });
+    return;
+  }
+
+  const seen = readBoolean(req.body?.seen, true);
+
+  try {
+    const { data, error } = await supabase
+      .from('user_profiles')
+      .select(`user_id, ${TUTORIAL_STATE_COLUMN}`)
+      .eq('user_id', req.auth.userId)
+      .maybeSingle();
+
+    if (error) {
+      if (isMissingSchemaError(error)) {
+        res.status(500).json({
+          error: `Profile schema is out of date. ${USER_PROFILE_SCHEMA_GUIDE}`,
+        });
+        return;
+      }
+
+      throw error;
+    }
+
+    const tutorialState = normalizeTutorialState(data?.[TUTORIAL_STATE_COLUMN]);
+    const nextTutorialState = {
+      ...tutorialState,
+      [tutorialKey]: Boolean(seen),
+    };
+
+    const { error: persistError } = await supabase
+      .from('user_profiles')
+      .upsert(
+        {
+          user_id: req.auth.userId,
+          [TUTORIAL_STATE_COLUMN]: nextTutorialState,
+        },
+        { onConflict: 'user_id' },
+      );
+
+    if (persistError) {
+      if (isMissingSchemaError(persistError)) {
+        res.status(500).json({
+          error: `Profile schema is out of date. ${USER_PROFILE_SCHEMA_GUIDE}`,
+        });
+        return;
+      }
+
+      throw persistError;
+    }
+
+    res.json({
+      tutorialKey,
+      seen: Boolean(seen),
+      shouldShow: !Boolean(seen),
+    });
+  } catch (error) {
+    res.status(500).json({
+      error: 'Failed to save tutorial state.',
+      details: error && typeof error === 'object' && 'message' in error ? error.message : null,
+    });
+  }
+});
+
+app.get('/api/admin/overview', requireClerkAuth, requireAdminAccess, async (req, res) => {
+  try {
+    const [
+      usersCountResult,
+      foundItemsCountResult,
+      claimsCountResult,
+      submittedCountResult,
+      approvedCountResult,
+      pickedUpCountResult,
+      rejectedCountResult,
+      activePushCountResult,
+      recentFoundItemsResult,
+      recentRequestsResult,
+    ] = await Promise.all([
+      supabase.from('user_profiles').select('user_id', { count: 'exact', head: true }),
+      supabase.from('found_items').select('id', { count: 'exact', head: true }),
+      supabase.from('match_requests').select('id', { count: 'exact', head: true }),
+      supabase.from('match_requests').select('id', { count: 'exact', head: true }).eq('status', 'submitted'),
+      supabase.from('match_requests').select('id', { count: 'exact', head: true }).eq('status', 'approved'),
+      supabase.from('match_requests').select('id', { count: 'exact', head: true }).eq('status', 'picked_up'),
+      supabase.from('match_requests').select('id', { count: 'exact', head: true }).eq('status', 'rejected'),
+      supabase.from(PUSH_DEVICE_TOKEN_TABLE).select('id', { count: 'exact', head: true }).eq('is_active', true),
+      supabase
+        .from('found_items')
+        .select('id,title,category,location,created_at,created_by,image_url')
+        .order('created_at', { ascending: false })
+        .limit(18),
+      supabase
+        .from('match_requests')
+        .select(
+          `
+          id,
+          status,
+          created_at,
+          claimant_user_id,
+          found_item_id,
+          found_item:found_items(
+            id,
+            title,
+            category,
+            location,
+            created_by
+          )
+        `,
+        )
+        .order('created_at', { ascending: false })
+        .limit(24),
+    ]);
+
+    const fatalError = [
+      usersCountResult.error,
+      foundItemsCountResult.error,
+      claimsCountResult.error,
+      submittedCountResult.error,
+      approvedCountResult.error,
+      pickedUpCountResult.error,
+      rejectedCountResult.error,
+      recentFoundItemsResult.error,
+      recentRequestsResult.error,
+    ].find((error) => Boolean(error));
+
+    if (fatalError) {
+      throw fatalError;
+    }
+
+    const recentRequests = (recentRequestsResult.data ?? []).map((row) => ({
+      ...row,
+      found_item: relationObject(row.found_item),
+    }));
+
+    const pushDataMissing = Boolean(activePushCountResult.error && isMissingSchemaError(activePushCountResult.error));
+    const activePushDevices = pushDataMissing ? 0 : Math.max(0, Math.round(readNumber(activePushCountResult.count)));
+
+    res.json({
+      adminEmail: req.auth.adminEmail,
+      counts: {
+        users: Math.max(0, Math.round(readNumber(usersCountResult.count))),
+        foundItems: Math.max(0, Math.round(readNumber(foundItemsCountResult.count))),
+        claims: Math.max(0, Math.round(readNumber(claimsCountResult.count))),
+        submittedClaims: Math.max(0, Math.round(readNumber(submittedCountResult.count))),
+        approvedClaims: Math.max(0, Math.round(readNumber(approvedCountResult.count))),
+        pickedUpClaims: Math.max(0, Math.round(readNumber(pickedUpCountResult.count))),
+        rejectedClaims: Math.max(0, Math.round(readNumber(rejectedCountResult.count))),
+        activePushDevices,
+      },
+      recentFoundItems: recentFoundItemsResult.data ?? [],
+      recentRequests,
+      pushTableReady: !pushDataMissing,
+    });
+  } catch (error) {
+    res.status(500).json({
+      error: 'Failed to load admin overview.',
+      details: error && typeof error === 'object' && 'message' in error ? error.message : null,
+    });
+  }
+});
+
+app.get('/api/admin/found-items', requireClerkAuth, requireAdminAccess, async (req, res) => {
+  const limit = clampNumber(readPositiveNumber(req.query?.limit) || 30, 1, 120);
+
+  try {
+    const { data, error } = await supabase
+      .from('found_items')
+      .select('id,title,category,location,image_url,created_at,created_by')
+      .order('created_at', { ascending: false })
+      .limit(limit);
+
+    if (error) {
+      throw error;
+    }
+
+    res.json({ items: data ?? [] });
+  } catch (error) {
+    res.status(500).json({
+      error: 'Failed to load found items for admin.',
+      details: error && typeof error === 'object' && 'message' in error ? error.message : null,
+    });
+  }
+});
+
+app.delete('/api/admin/found-items/:foundItemId', requireClerkAuth, requireAdminAccess, async (req, res) => {
+  const foundItemId = readText(req.params.foundItemId);
+
+  if (!foundItemId) {
+    res.status(400).json({ error: 'foundItemId is required.' });
+    return;
+  }
+
+  try {
+    const { data: foundItem, error: foundItemLookupError } = await supabase
+      .from('found_items')
+      .select('id,title,created_by')
+      .eq('id', foundItemId)
+      .maybeSingle();
+
+    if (foundItemLookupError) {
+      throw foundItemLookupError;
+    }
+
+    if (!foundItem) {
+      res.status(404).json({ error: 'Found item not found.' });
+      return;
+    }
+
+    await supabase.from('match_requests').delete().eq('found_item_id', foundItemId);
+
+    const { error } = await supabase.from('found_items').delete().eq('id', foundItemId);
+
+    if (error) {
+      throw error;
+    }
+
+    await sendPushToUsersSafely({
+      userIds: [readText(foundItem.created_by)],
+      title: 'UniSync Admin Update',
+      body: `Your uploaded item "${readText(foundItem.title) || 'item'}" was removed by admin moderation.`,
+      data: {
+        type: 'admin_found_item_removed',
+        foundItemId,
+      },
+      preferenceColumn: 'notify_claim_updates',
+    });
+
+    res.json({ removed: true, foundItemId });
+  } catch (error) {
+    res.status(500).json({
+      error: 'Failed to remove found item.',
+      details: error && typeof error === 'object' && 'message' in error ? error.message : null,
+    });
+  }
+});
+
+app.get('/api/admin/match-requests', requireClerkAuth, requireAdminAccess, async (req, res) => {
+  const limit = clampNumber(readPositiveNumber(req.query?.limit) || 40, 1, 150);
+  const status = readText(req.query?.status).toLowerCase();
+
+  try {
+    let query = supabase
+      .from('match_requests')
+      .select(
+        `
+        id,
+        status,
+        created_at,
+        reviewed_at,
+        pickup_confirmed_at,
+        claimant_user_id,
+        found_item_id,
+        found_item:found_items(
+          id,
+          title,
+          category,
+          location,
+          created_by
+        )
+      `,
+      )
+      .order('created_at', { ascending: false })
+      .limit(limit);
+
+    if (status) {
+      query = query.eq('status', status);
+    }
+
+    const { data, error } = await query;
+
+    if (error) {
+      throw error;
+    }
+
+    const items = (data ?? []).map((row) => ({
+      ...row,
+      found_item: relationObject(row.found_item),
+    }));
+
+    res.json({ items });
+  } catch (error) {
+    res.status(500).json({
+      error: 'Failed to load match requests for admin.',
+      details: error && typeof error === 'object' && 'message' in error ? error.message : null,
+    });
+  }
+});
+
+app.patch('/api/admin/match-requests/:requestId', requireClerkAuth, requireAdminAccess, async (req, res) => {
+  const requestId = readText(req.params.requestId);
+  const nextStatus = readText(req.body?.status).toLowerCase();
+
+  if (!requestId) {
+    res.status(400).json({ error: 'requestId is required.' });
+    return;
+  }
+
+  if (!['submitted', 'approved', 'rejected', 'picked_up', 'cancelled'].includes(nextStatus)) {
+    res.status(400).json({ error: 'status is invalid.' });
+    return;
+  }
+
+  try {
+    const requestRow = await loadMatchRequestWithParticipants(requestId);
+
+    if (!requestRow) {
+      res.status(404).json({ error: 'Match request not found.' });
+      return;
+    }
+
+    const updatePayload = {
+      status: nextStatus,
+      reviewed_at:
+        nextStatus === 'approved' || nextStatus === 'rejected' || nextStatus === 'cancelled'
+          ? new Date().toISOString()
+          : null,
+      reviewer_user_id:
+        nextStatus === 'approved' || nextStatus === 'rejected' || nextStatus === 'cancelled'
+          ? req.auth.userId
+          : null,
+      pickup_confirmed_at: nextStatus === 'picked_up' ? new Date().toISOString() : null,
+      pickup_confirmed_by: nextStatus === 'picked_up' ? req.auth.userId : null,
+    };
+
+    const { data: updatedRequest, error: updateError } = await supabase
+      .from('match_requests')
+      .update(updatePayload)
+      .eq('id', requestId)
+      .select('*')
+      .maybeSingle();
+
+    if (updateError) {
+      throw updateError;
+    }
+
+    if (!updatedRequest) {
+      res.status(409).json({ error: 'Could not update match request.' });
+      return;
+    }
+
+    const ownerId = readText(requestRow.found_item?.created_by);
+    const claimantId = readText(requestRow.claimant_user_id);
+    const foundItemTitle = readText(requestRow.found_item?.title) || 'item';
+
+    await sendPushToUsersSafely({
+      userIds: [ownerId, claimantId],
+      title: 'Claim status updated by admin',
+      body: `Request for "${foundItemTitle}" is now ${nextStatus.replace('_', ' ')}.`,
+      data: {
+        type: 'admin_match_request_update',
+        requestId,
+        status: nextStatus,
+      },
+      preferenceColumn: 'notify_claim_updates',
+    });
+
+    res.json({ updated: true, request: updatedRequest });
+  } catch (error) {
+    res.status(500).json({
+      error: 'Failed to update match request.',
+      details: error && typeof error === 'object' && 'message' in error ? error.message : null,
+    });
+  }
+});
+
+app.post('/api/admin/notifications/broadcast', requireClerkAuth, requireAdminAccess, async (req, res) => {
+  const title = readText(req.body?.title) || 'UniSync Admin Notice';
+  const message = readText(req.body?.message || req.body?.body);
+  const targetUserId = readText(req.body?.target_user_id);
+
+  if (!message) {
+    res.status(400).json({ error: 'message is required.' });
+    return;
+  }
+
+  try {
+    let recipientIds = [];
+
+    if (targetUserId) {
+      recipientIds = [targetUserId];
+    } else {
+      const { data, error } = await supabase
+        .from(PUSH_DEVICE_TOKEN_TABLE)
+        .select('user_id')
+        .eq('is_active', true)
+        .limit(5000);
+
+      if (error) {
+        if (isMissingSchemaError(error)) {
+          res.status(500).json({
+            error:
+              'Push device token table is missing. Run SQL migration 026_create_push_device_tokens.sql.',
+          });
+          return;
+        }
+
+        throw error;
+      }
+
+      recipientIds = Array.from(
+        new Set((data ?? []).map((row) => readText(row.user_id)).filter(Boolean)),
+      );
+    }
+
+    const delivery = await sendPushToUsersSafely({
+      userIds: recipientIds,
+      title,
+      body: message,
+      data: {
+        type: 'admin_broadcast',
+      },
+      preferenceColumn: null,
+    });
+
+    res.status(201).json({
+      sent: delivery.sent,
+      attempted: delivery.attempted,
+      recipients: delivery.recipients,
+      targetMode: targetUserId ? 'single' : 'broadcast',
+    });
+  } catch (error) {
+    res.status(500).json({
+      error: 'Failed to send admin broadcast notification.',
+      details: error && typeof error === 'object' && 'message' in error ? error.message : null,
+    });
+  }
+});
+
 app.post('/api/vision/classify-item', requireClerkAuth, async (req, res) => {
   const body = req.body || {};
   const imageBase64 = readText(body.image_base64);
@@ -1559,6 +2640,18 @@ app.post('/api/match-requests/auto', requireClerkAuth, async (req, res) => {
       referenceId: requestRow.id,
     });
 
+    await sendPushToUsersSafely({
+      userIds: [readText(best.candidate.created_by)],
+      title: 'New claim request submitted',
+      body: `${readText(best.candidate.title) || 'One of your found items'} has a new ownership claim.`,
+      data: {
+        type: 'claim_submitted',
+        requestId: requestRow.id,
+        foundItemId: best.candidate.id,
+      },
+      preferenceColumn: 'notify_claim_updates',
+    });
+
     res.status(201).json({
       matched: true,
       request: requestRow,
@@ -1713,6 +2806,18 @@ app.post('/api/match-requests', requireClerkAuth, async (req, res) => {
       reason: 'match_request_submitted',
       referenceType: 'match_request',
       referenceId: requestRow.id,
+    });
+
+    await sendPushToUsersSafely({
+      userIds: [readText(foundItem.created_by)],
+      title: 'New claim request submitted',
+      body: `${readText(foundItem.title) || 'One of your found items'} has a new ownership claim.`,
+      data: {
+        type: 'claim_submitted',
+        requestId: requestRow.id,
+        foundItemId,
+      },
+      preferenceColumn: 'notify_claim_updates',
     });
 
     res.status(201).json({
@@ -1950,6 +3055,18 @@ app.post('/api/match-requests/:requestId/resolve', requireClerkAuth, async (req,
         return;
       }
 
+      await sendPushToUsersSafely({
+        userIds: [readText(requestRow.claimant_user_id)],
+        title: 'Claim update: rejected',
+        body: `Your claim for "${readText(foundItem.title) || 'item'}" was rejected by the finder.`,
+        data: {
+          type: 'claim_rejected',
+          requestId,
+          foundItemId: readText(requestRow.found_item_id),
+        },
+        preferenceColumn: 'notify_claim_updates',
+      });
+
       res.json({ resolved: true, action: 'reject', request: updatedRequest });
       return;
     }
@@ -2031,6 +3148,18 @@ app.post('/api/match-requests/:requestId/resolve', requireClerkAuth, async (req,
         referenceId: updatedRequest.id,
       });
     }
+
+    await sendPushToUsersSafely({
+      userIds: [claimantUserId],
+      title: 'Claim approved',
+      body: `Your claim for "${readText(foundItem.title) || 'item'}" has been approved.`,
+      data: {
+        type: 'claim_approved',
+        requestId,
+        foundItemId: readText(requestRow.found_item_id),
+      },
+      preferenceColumn: 'notify_claim_updates',
+    });
 
     res.json({
       resolved: true,
@@ -2148,6 +3277,18 @@ app.post('/api/match-requests/:requestId/confirm-pickup', requireClerkAuth, asyn
       });
     }
 
+    await sendPushToUsersSafely({
+      userIds: [claimantUserId],
+      title: 'Pickup confirmed',
+      body: `Pickup for "${readText(foundItem?.title) || 'your claimed item'}" has been confirmed.`,
+      data: {
+        type: 'pickup_confirmed',
+        requestId,
+        foundItemId: readText(requestRow.found_item_id),
+      },
+      preferenceColumn: 'notify_claim_updates',
+    });
+
     const pickupEditWindow = resolvePickupEditWindow(updatedRequest.pickup_confirmed_at);
 
     res.json({
@@ -2229,6 +3370,18 @@ app.post('/api/match-requests/:requestId/revert-pickup', requireClerkAuth, async
         .update({ status: 'claimed' })
         .eq('id', requestRow.lost_item_id);
     }
+
+    await sendPushToUsersSafely({
+      userIds: [readText(requestRow.claimant_user_id)],
+      title: 'Pickup status changed',
+      body: `Pickup for "${readText(requestRow.found_item?.title) || 'your item'}" was reverted to approved.`,
+      data: {
+        type: 'pickup_reverted',
+        requestId,
+        foundItemId: readText(requestRow.found_item_id),
+      },
+      preferenceColumn: 'notify_claim_updates',
+    });
 
     res.json({
       reverted: true,
@@ -2373,6 +3526,21 @@ app.post('/api/match-requests/:requestId/messages', requireClerkAuth, async (req
           warning:
             'Chat database table is not deployed yet. Messages are temporary until migration 016 is applied.',
         });
+
+        const counterpartUserId = req.auth.userId === ownerId ? claimantId : ownerId;
+        await sendPushToUsersSafely({
+          userIds: [counterpartUserId],
+          title: 'New message on claim thread',
+          body: messageText.length > 80 ? `${messageText.slice(0, 77)}...` : messageText,
+          data: {
+            type: 'claim_message',
+            requestId,
+            foundItemId: readText(requestRow.found_item_id),
+            autoOpenMessages: true,
+          },
+          preferenceColumn: 'notify_messages',
+        });
+
         return;
       }
 
@@ -2383,6 +3551,20 @@ app.post('/api/match-requests/:requestId/messages', requireClerkAuth, async (req
       message: messageRow,
       messagingActive: true,
       requestStatus: readText(requestRow.status),
+    });
+
+    const counterpartUserId = req.auth.userId === ownerId ? claimantId : ownerId;
+    await sendPushToUsersSafely({
+      userIds: [counterpartUserId],
+      title: 'New message on claim thread',
+      body: messageText.length > 80 ? `${messageText.slice(0, 77)}...` : messageText,
+      data: {
+        type: 'claim_message',
+        requestId,
+        foundItemId: readText(requestRow.found_item_id),
+        autoOpenMessages: true,
+      },
+      preferenceColumn: 'notify_messages',
     });
   } catch (error) {
     res.status(500).json({

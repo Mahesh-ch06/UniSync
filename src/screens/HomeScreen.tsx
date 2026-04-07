@@ -1,7 +1,7 @@
 import MaterialIcons from '@expo/vector-icons/MaterialIcons';
 import { useAuth } from '@clerk/clerk-expo';
 import { useUser } from '@clerk/clerk-expo';
-import { NavigationProp, useFocusEffect, useNavigation } from '@react-navigation/native';
+import { NavigationProp, useNavigation } from '@react-navigation/native';
 import * as SecureStore from 'expo-secure-store';
 import * as ImagePicker from 'expo-image-picker';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
@@ -9,6 +9,7 @@ import {
   ActivityIndicator,
   Animated,
   Image,
+  LayoutChangeEvent,
   Modal,
   Pressable,
   RefreshControl,
@@ -16,25 +17,23 @@ import {
   StyleSheet,
   Text,
   TextInput,
+  useWindowDimensions,
   View,
 } from 'react-native';
-import { SafeAreaView } from 'react-native-safe-area-context';
+import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { AppTopBar } from '../components/AppTopBar';
 import { CampusActionStudio } from '../components/CampusActionStudio';
 import { ErrorBoundary } from '../components/ErrorBoundary';
 import { backendEnv } from '../config/env';
-import {
-  mapHistoryRowsToNotifications,
-  NOTIFICATION_SEEN_STORAGE_PREFIX,
-  type NotificationEntry,
-} from '../lib/notifications';
 import { useNotificationBadge } from '../lib/notificationBadge';
 import { buildSupabaseClient } from '../lib/supabase';
+import { markTutorialCompleted, shouldShowTutorial } from '../lib/tutorialSeen';
 import { colors, fontFamily, radii, shadows } from '../theme/tokens';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const APPROVED_POPUP_STORAGE_PREFIX = 'approved-claim-popup-seen-v1';
+const HOME_TUTORIAL_STORAGE_PREFIX = 'home-onboarding-tutorial-seen-v1';
 const REQUEST_TIMEOUT_MS = 15000;
 
 type CampusZone = 'Academic' | 'Residence' | 'Transit' | 'Commons' | 'General';
@@ -87,6 +86,53 @@ type HomeTabNavigationParams = {
   Settings: undefined;
 };
 
+type TutorialTarget = 'hero' | 'search' | 'filters' | 'items' | 'actions';
+
+type TutorialStep = {
+  target: TutorialTarget;
+  title: string;
+  description: string;
+  tip: string;
+};
+
+const HOME_TUTORIAL_STEPS: TutorialStep[] = [
+  {
+    target: 'hero',
+    title: 'Welcome To UniSync',
+    description:
+      'This home dashboard is your command center for finding lost items and starting claim flows.',
+    tip: 'Start with search or category filters before opening a claim.',
+  },
+  {
+    target: 'search',
+    title: 'Search And Camera Match',
+    description:
+      'Use the search bar for quick text lookup, or tap the camera icon to let AI match your item image.',
+    tip: 'Clear, close-up images improve AI match quality and confidence.',
+  },
+  {
+    target: 'filters',
+    title: 'Narrow Results Fast',
+    description:
+      'Switch categories, sorting mode, and 24-hour filter to focus only on the most relevant found items.',
+    tip: 'Priority mode pushes high-confidence and urgent matches to the top.',
+  },
+  {
+    target: 'items',
+    title: 'Review And Claim Items',
+    description:
+      'Open the item list, verify details, then tap Claim Product to submit proof and contact the finder.',
+    tip: 'Check location and time first so you only claim the correct item.',
+  },
+  {
+    target: 'actions',
+    title: 'Quick Actions Studio',
+    description:
+      'Use quick actions to report new lost/found items and continue claim workflows without leaving home.',
+    tip: 'Use the History tab to track claim status updates and pickup steps.',
+  },
+];
+
 function readText(value: unknown): string | null {
   if (typeof value !== 'string') {
     return null;
@@ -102,6 +148,24 @@ function readIdentifier(value: unknown): string | null {
   }
 
   return readText(value);
+}
+
+function resolveTimestampMs(value: unknown): number {
+  if (value instanceof Date) {
+    const parsed = value.getTime();
+    return Number.isFinite(parsed) ? parsed : 0;
+  }
+
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value;
+  }
+
+  if (typeof value === 'string') {
+    const parsed = new Date(value).getTime();
+    return Number.isFinite(parsed) ? parsed : 0;
+  }
+
+  return 0;
 }
 
 function inferCampusZone(location: string): CampusZone {
@@ -412,11 +476,15 @@ function FoundItemCard({
 export function HomeScreen() {
   const { getToken } = useAuth();
   const { user } = useUser();
-  const { setUnreadCount } = useNotificationBadge();
+  const { unreadCount, requestSync } = useNotificationBadge();
+  const insets = useSafeAreaInsets();
+  const { height: windowHeight } = useWindowDimensions();
   const navigation = useNavigation<NavigationProp<HomeTabNavigationParams>>();
+  const scrollViewRef = useRef<ScrollView | null>(null);
   const getTokenRef = useRef(getToken);
   const approvedPopupScale = useRef(new Animated.Value(0.86)).current;
   const approvedPopupOpacity = useRef(new Animated.Value(0)).current;
+  const tutorialPulse = useRef(new Animated.Value(0)).current;
   const currentUserId = readText(user?.id) ?? '';
 
   const [allItems, setAllItems] = useState<FoundItem[]>([]);
@@ -433,11 +501,17 @@ export function HomeScreen() {
   const [claimIntentNonce, setClaimIntentNonce] = useState(0);
   const [focusedItemId, setFocusedItemId] = useState('');
   const [approvedClaimReminders, setApprovedClaimReminders] = useState<ApprovedClaimReminder[]>([]);
-  const [notificationEntries, setNotificationEntries] = useState<NotificationEntry[]>([]);
-  const [seenNotificationIds, setSeenNotificationIds] = useState<string[]>([]);
   const [approvedPopupSeenRequestIds, setApprovedPopupSeenRequestIds] = useState<string[]>([]);
   const [approvedPopupReminder, setApprovedPopupReminder] = useState<ApprovedClaimReminder | null>(null);
   const [isApprovedPopupVisible, setIsApprovedPopupVisible] = useState(false);
+  const [isTutorialVisible, setIsTutorialVisible] = useState(false);
+  const [tutorialStepIndex, setTutorialStepIndex] = useState(0);
+  const [tutorialLayouts, setTutorialLayouts] = useState<
+    Partial<Record<TutorialTarget, { y: number; height: number }>>
+  >({});
+  const [tutorialPlacement, setTutorialPlacement] = useState<'top' | 'bottom'>('bottom');
+  const [tutorialCardHeight, setTutorialCardHeight] = useState(0);
+  const [hasTutorialBeenSeen, setHasTutorialBeenSeen] = useState(true);
   const [aiPopup, setAiPopup] = useState<AiPopupState>({
     visible: false,
     status: 'not-found',
@@ -453,45 +527,226 @@ export function HomeScreen() {
   const approvedPopupStorageKey = currentUserId
     ? `${APPROVED_POPUP_STORAGE_PREFIX}:${currentUserId}`
     : '';
-  const notificationSeenStorageKey = currentUserId
-    ? `${NOTIFICATION_SEEN_STORAGE_PREFIX}:${currentUserId}`
-    : '';
+  const userCreatedAtMs = useMemo(() => resolveTimestampMs(user?.createdAt), [user?.createdAt]);
+  const showTutorialEntry = Boolean(currentUserId) && !hasTutorialBeenSeen;
+  const tutorialSyncOptions = useMemo(
+    () => ({
+      tutorialKey: HOME_TUTORIAL_STORAGE_PREFIX,
+      userId: currentUserId,
+      backendBaseUrl: backendEnv.backendUrl,
+      getToken: async () => await getTokenRef.current().catch(() => null),
+      userCreatedAtMs,
+    }),
+    [currentUserId, userCreatedAtMs],
+  );
+  const activeTutorialStep = HOME_TUTORIAL_STEPS[tutorialStepIndex] ?? HOME_TUTORIAL_STEPS[0];
+  const tutorialPulseShadowOpacity = tutorialPulse.interpolate({
+    inputRange: [0, 1],
+    outputRange: [0.2, 0.42],
+  });
 
-  const loadSeenNotifications = useCallback(async () => {
-    if (!notificationSeenStorageKey) {
-      setSeenNotificationIds([]);
+  const recordTutorialSectionLayout = useCallback(
+    (target: TutorialTarget) => (event: LayoutChangeEvent) => {
+      const nextY = event.nativeEvent.layout.y;
+      const nextHeight = event.nativeEvent.layout.height;
+
+      setTutorialLayouts((previous) => {
+        const current = previous[target];
+        if (
+          current &&
+          Math.abs(current.y - nextY) < 2 &&
+          Math.abs(current.height - nextHeight) < 2
+        ) {
+          return previous;
+        }
+
+        return {
+          ...previous,
+          [target]: {
+            y: nextY,
+            height: nextHeight,
+          },
+        };
+      });
+    },
+    [],
+  );
+
+  const markTutorialSeen = useCallback(async () => {
+    if (!tutorialSyncOptions.userId) {
+      return false;
+    }
+
+    setHasTutorialBeenSeen(true);
+
+    return await markTutorialCompleted(tutorialSyncOptions);
+  }, [tutorialSyncOptions]);
+
+  const startTutorial = useCallback(() => {
+    setTutorialStepIndex(0);
+    setIsTutorialVisible(true);
+  }, []);
+
+  const closeTutorial = useCallback(
+    (markSeen: boolean) => {
+      setIsTutorialVisible(false);
+
+      if (markSeen) {
+        void markTutorialSeen();
+      }
+    },
+    [markTutorialSeen],
+  );
+
+  const handleTutorialBack = useCallback(() => {
+    setTutorialStepIndex((previous) => Math.max(0, previous - 1));
+  }, []);
+
+  const handleTutorialNext = useCallback(() => {
+    if (tutorialStepIndex >= HOME_TUTORIAL_STEPS.length - 1) {
+      closeTutorial(true);
+      setAiNotice('Tutorial completed. Tip: use camera search for faster claim matching.');
       return;
     }
 
-    try {
-      const serialized = await SecureStore.getItemAsync(notificationSeenStorageKey);
-      const parsed = serialized ? (JSON.parse(serialized) as unknown) : [];
+    setTutorialStepIndex((previous) => Math.min(previous + 1, HOME_TUTORIAL_STEPS.length - 1));
+  }, [closeTutorial, tutorialStepIndex]);
 
-      if (!Array.isArray(parsed)) {
-        setSeenNotificationIds([]);
+  const resolveTutorialSectionStyle = useCallback(
+    (target: TutorialTarget) => {
+      if (!isTutorialVisible || !activeTutorialStep) {
+        return undefined;
+      }
+
+      if (activeTutorialStep.target === target) {
+        return [
+          styles.tutorialSectionActive,
+          {
+            shadowOpacity: tutorialPulseShadowOpacity,
+          },
+        ];
+      }
+
+      return styles.tutorialSectionMuted;
+    },
+    [activeTutorialStep, isTutorialVisible, tutorialPulseShadowOpacity],
+  );
+
+  useEffect(() => {
+    let isActive = true;
+    let timerId: ReturnType<typeof setTimeout> | null = null;
+
+    const maybeShowTutorial = async () => {
+      if (!tutorialSyncOptions.userId) {
+        setHasTutorialBeenSeen(true);
+        setIsTutorialVisible(false);
+        setTutorialStepIndex(0);
         return;
       }
 
-      const normalized = parsed
-        .map((value) => (typeof value === 'string' ? value.trim() : ''))
-        .filter((value) => Boolean(value));
+      const shouldShow = await shouldShowTutorial(tutorialSyncOptions);
 
-      setSeenNotificationIds(normalized);
-    } catch {
-      setSeenNotificationIds([]);
-    }
-  }, [notificationSeenStorageKey]);
+      if (!isActive) {
+        return;
+      }
+
+      if (!shouldShow) {
+        setHasTutorialBeenSeen(true);
+        return;
+      }
+
+      setHasTutorialBeenSeen(false);
+
+      timerId = setTimeout(() => {
+        if (!isActive) {
+          return;
+        }
+
+        setTutorialStepIndex(0);
+        setIsTutorialVisible(true);
+      }, 540);
+    };
+
+    void maybeShowTutorial();
+
+    return () => {
+      isActive = false;
+
+      if (timerId) {
+        clearTimeout(timerId);
+      }
+    };
+  }, [tutorialSyncOptions]);
 
   useEffect(() => {
-    void loadSeenNotifications();
-  }, [loadSeenNotifications]);
+    if (!isTutorialVisible) {
+      tutorialPulse.stopAnimation();
+      tutorialPulse.setValue(0);
+      return;
+    }
 
-  useFocusEffect(
-    useCallback(() => {
-      void loadSeenNotifications();
-      return undefined;
-    }, [loadSeenNotifications]),
-  );
+    const pulseLoop = Animated.loop(
+      Animated.sequence([
+        Animated.timing(tutorialPulse, {
+          toValue: 1,
+          duration: 620,
+          useNativeDriver: false,
+        }),
+        Animated.timing(tutorialPulse, {
+          toValue: 0,
+          duration: 620,
+          useNativeDriver: false,
+        }),
+      ]),
+    );
+
+    pulseLoop.start();
+
+    return () => {
+      pulseLoop.stop();
+      tutorialPulse.stopAnimation();
+      tutorialPulse.setValue(0);
+    };
+  }, [isTutorialVisible, tutorialPulse]);
+
+  useEffect(() => {
+    if (!isTutorialVisible || !activeTutorialStep) {
+      return;
+    }
+
+    const targetLayout = tutorialLayouts[activeTutorialStep.target];
+    if (!targetLayout) {
+      return;
+    }
+
+    const targetMidpoint = targetLayout.y + targetLayout.height * 0.5;
+    const nextPlacement = targetMidpoint > windowHeight * 0.56 ? 'top' : 'bottom';
+
+    if (tutorialPlacement !== nextPlacement) {
+      setTutorialPlacement(nextPlacement);
+    }
+
+    const scrollOffset =
+      nextPlacement === 'top' ? Math.max(tutorialCardHeight + 102, 310) : 108;
+
+    const scrollDelay = setTimeout(() => {
+      scrollViewRef.current?.scrollTo({
+        y: Math.max(targetLayout.y - scrollOffset, 0),
+        animated: true,
+      });
+    }, 90);
+
+    return () => {
+      clearTimeout(scrollDelay);
+    };
+  }, [
+    activeTutorialStep,
+    isTutorialVisible,
+    tutorialCardHeight,
+    tutorialLayouts,
+    tutorialPlacement,
+    windowHeight,
+  ]);
 
   useEffect(() => {
     let isActive = true;
@@ -562,7 +817,7 @@ export function HomeScreen() {
   );
 
   useEffect(() => {
-    if (!approvedClaimReminders.length || isApprovedPopupVisible) {
+    if (!approvedClaimReminders.length || isApprovedPopupVisible || isTutorialVisible) {
       return;
     }
 
@@ -581,8 +836,17 @@ export function HomeScreen() {
     approvedClaimReminders,
     approvedPopupSeenRequestIds,
     isApprovedPopupVisible,
+    isTutorialVisible,
     rememberApprovedPopupShown,
   ]);
+
+  useEffect(() => {
+    if (!isTutorialVisible || !isApprovedPopupVisible) {
+      return;
+    }
+
+    setIsApprovedPopupVisible(false);
+  }, [isApprovedPopupVisible, isTutorialVisible]);
 
   useEffect(() => {
     if (!isApprovedPopupVisible) {
@@ -698,15 +962,6 @@ export function HomeScreen() {
     };
   }, [allItems]);
 
-  const homeUnreadNotificationCount = useMemo(
-    () => notificationEntries.filter((entry) => !seenNotificationIds.includes(entry.id)).length,
-    [notificationEntries, seenNotificationIds],
-  );
-
-  useEffect(() => {
-    setUnreadCount(homeUnreadNotificationCount);
-  }, [homeUnreadNotificationCount, setUnreadCount]);
-
   const loadItems = useCallback(async (options?: { soft?: boolean }) => {
     const soft = options?.soft ?? false;
 
@@ -752,8 +1007,6 @@ export function HomeScreen() {
             items?: Record<string, unknown>[];
           };
 
-          setNotificationEntries(mapHistoryRowsToNotifications(historyPayload.items, currentUserId, 80));
-
           const reminders = Array.isArray(historyPayload.items)
             ? historyPayload.items
                 .map((row) => {
@@ -794,7 +1047,6 @@ export function HomeScreen() {
           setApprovedClaimReminders(reminders);
         } else {
           setApprovedClaimReminders([]);
-          setNotificationEntries([]);
         }
 
         return;
@@ -806,7 +1058,6 @@ export function HomeScreen() {
       if (!client) {
         setErrorText('Supabase is not configured yet. Add keys in your .env file.');
         setApprovedClaimReminders([]);
-        setNotificationEntries([]);
 
         if (!soft) {
           setAllItems([]);
@@ -827,7 +1078,6 @@ export function HomeScreen() {
 
       setAllItems((data ?? []).map((row) => mapRowToItem(row as Record<string, unknown>)));
       setApprovedClaimReminders([]);
-      setNotificationEntries([]);
     } catch (error) {
       const message =
         typeof error === 'object' &&
@@ -844,7 +1094,6 @@ export function HomeScreen() {
       }
 
       setApprovedClaimReminders([]);
-      setNotificationEntries([]);
     } finally {
       if (!soft) {
         setIsLoading(false);
@@ -864,7 +1113,8 @@ export function HomeScreen() {
 
   const handleStudioActionsFinished = useCallback(async () => {
     await loadItems({ soft: true });
-  }, [loadItems]);
+    requestSync();
+  }, [loadItems, requestSync]);
 
   const readResponseError = useCallback(async (response: Response): Promise<string> => {
     try {
@@ -1069,39 +1319,65 @@ export function HomeScreen() {
         leftIcon="person"
         onLeftPress={() => navigation.navigate('Profile')}
         onRightPress={() => navigation.navigate('Notifications')}
-        rightBadgeCount={homeUnreadNotificationCount}
-        rightIcon={homeUnreadNotificationCount > 0 ? 'notifications' : 'notifications-none'}
+        rightBadgeCount={unreadCount}
+        rightIcon={unreadCount > 0 ? 'notifications' : 'notifications-none'}
         title="UniSync"
       />
 
       <ScrollView
-        contentContainerStyle={styles.content}
+        ref={scrollViewRef}
+        contentContainerStyle={[
+          styles.content,
+          isTutorialVisible ? styles.contentTutorialActive : undefined,
+        ]}
         refreshControl={<RefreshControl onRefresh={handleRefresh} refreshing={isRefreshing} />}
         showsVerticalScrollIndicator={false}
       >
-        <View style={styles.heroCard}>
-          <Text style={styles.heroTitle}>Lost & Found</Text>
-          <Text style={styles.heroSubtitle}>
-            Find items faster, submit claims safely, and help items return to the right owner.
-          </Text>
+        <Animated.View
+          onLayout={recordTutorialSectionLayout('hero')}
+          style={resolveTutorialSectionStyle('hero')}
+        >
+          <View style={styles.heroCard}>
+            <View style={styles.heroHeaderRow}>
+              <View style={styles.heroHeaderBody}>
+                <Text style={styles.heroTitle}>Lost & Found</Text>
+                <Text style={styles.heroSubtitle}>
+                  Find items faster, submit claims safely, and help items return to the right owner.
+                </Text>
+              </View>
 
-          <View style={styles.heroStepsRow}>
-            <View style={styles.heroStepChip}>
-              <MaterialIcons color={colors.primary} name="search" size={14} />
-              <Text style={styles.heroStepText}>Find</Text>
+              {showTutorialEntry ? (
+                <Pressable
+                  onPress={startTutorial}
+                  style={({ pressed }) => [
+                    styles.heroTutorialButton,
+                    pressed ? styles.heroTutorialButtonPressed : undefined,
+                  ]}
+                >
+                  <MaterialIcons color={colors.primary} name="tips-and-updates" size={13} />
+                  <Text style={styles.heroTutorialButtonText}>Tutorial</Text>
+                </Pressable>
+              ) : null}
             </View>
 
-            <View style={styles.heroStepChip}>
-              <MaterialIcons color={colors.primary} name="photo-camera" size={14} />
-              <Text style={styles.heroStepText}>Scan</Text>
-            </View>
+            <View style={styles.heroStepsRow}>
+              <View style={styles.heroStepChip}>
+                <MaterialIcons color={colors.primary} name="search" size={14} />
+                <Text style={styles.heroStepText}>Find</Text>
+              </View>
 
-            <View style={styles.heroStepChip}>
-              <MaterialIcons color={colors.primary} name="verified-user" size={14} />
-              <Text style={styles.heroStepText}>Claim</Text>
+              <View style={styles.heroStepChip}>
+                <MaterialIcons color={colors.primary} name="photo-camera" size={14} />
+                <Text style={styles.heroStepText}>Scan</Text>
+              </View>
+
+              <View style={styles.heroStepChip}>
+                <MaterialIcons color={colors.primary} name="verified-user" size={14} />
+                <Text style={styles.heroStepText}>Claim</Text>
+              </View>
             </View>
           </View>
-        </View>
+        </Animated.View>
 
         {approvedClaimReminders.length ? (
           <View style={styles.approvedClaimSection}>
@@ -1193,35 +1469,40 @@ export function HomeScreen() {
           </View>
         </Modal>
 
-        <View style={styles.searchShell}>
-          <MaterialIcons color={colors.outline} name="search" size={20} style={styles.searchIcon} />
-          <TextInput
-            onChangeText={setSearchText}
-            placeholder="Search item, category, or location"
-            placeholderTextColor={colors.outline}
-            style={styles.searchInput}
-            value={searchText}
-          />
+        <Animated.View
+          onLayout={recordTutorialSectionLayout('search')}
+          style={resolveTutorialSectionStyle('search')}
+        >
+          <View style={styles.searchShell}>
+            <MaterialIcons color={colors.outline} name="search" size={20} style={styles.searchIcon} />
+            <TextInput
+              onChangeText={setSearchText}
+              placeholder="Search item, category, or location"
+              placeholderTextColor={colors.outline}
+              style={styles.searchInput}
+              value={searchText}
+            />
 
-          <View style={styles.searchCameraDivider} />
+            <View style={styles.searchCameraDivider} />
 
-          <Pressable disabled={isAiSearching} onPress={() => void scanAndOpenClaim()} style={styles.searchCameraButton}>
-            {isAiSearching ? (
-              <ActivityIndicator color={colors.primary} size="small" />
-            ) : (
-              <MaterialIcons color={colors.primary} name="photo-camera" size={18} />
-            )}
-          </Pressable>
-        </View>
-
-        {aiNotice ? (
-          <View style={styles.aiNoticeWrap}>
-            <MaterialIcons color={colors.primary} name="auto-awesome" size={14} />
-            <Text numberOfLines={2} style={styles.aiNoticeText}>
-              {aiNotice}
-            </Text>
+            <Pressable disabled={isAiSearching} onPress={() => void scanAndOpenClaim()} style={styles.searchCameraButton}>
+              {isAiSearching ? (
+                <ActivityIndicator color={colors.primary} size="small" />
+              ) : (
+                <MaterialIcons color={colors.primary} name="photo-camera" size={18} />
+              )}
+            </Pressable>
           </View>
-        ) : null}
+
+          {aiNotice ? (
+            <View style={styles.aiNoticeWrap}>
+              <MaterialIcons color={colors.primary} name="auto-awesome" size={14} />
+              <Text numberOfLines={2} style={styles.aiNoticeText}>
+                {aiNotice}
+              </Text>
+            </View>
+          ) : null}
+        </Animated.View>
 
         <Modal animationType="fade" onRequestClose={closeAiPopup} transparent visible={aiPopup.visible}>
           <View style={styles.aiModalBackdrop}>
@@ -1321,160 +1602,256 @@ export function HomeScreen() {
           </View>
         </Modal>
 
-        <ScrollView
-          contentContainerStyle={styles.chipsContent}
-          horizontal
-          showsHorizontalScrollIndicator={false}
-          style={styles.chipsWrap}
+        <Animated.View
+          onLayout={recordTutorialSectionLayout('filters')}
+          style={resolveTutorialSectionStyle('filters')}
         >
-          {categories.map((category) => {
-            const active = selectedCategory === category;
+          <ScrollView
+            contentContainerStyle={styles.chipsContent}
+            horizontal
+            showsHorizontalScrollIndicator={false}
+            style={styles.chipsWrap}
+          >
+            {categories.map((category) => {
+              const active = selectedCategory === category;
 
-            return (
-              <Pressable
-                key={category}
-                onPress={() => setSelectedCategory(category)}
-                style={[styles.filterChip, active ? styles.filterChipActive : styles.filterChipIdle]}
+              return (
+                <Pressable
+                  key={category}
+                  onPress={() => setSelectedCategory(category)}
+                  style={[styles.filterChip, active ? styles.filterChipActive : styles.filterChipIdle]}
+                >
+                  <Text style={[styles.filterChipText, active ? styles.filterChipTextActive : undefined]}>
+                    {category}
+                  </Text>
+                </Pressable>
+              );
+            })}
+          </ScrollView>
+
+          <View style={styles.sortRow}>
+            <Pressable
+              onPress={() => setSortMode('latest')}
+              style={[styles.sortButton, sortMode === 'latest' ? styles.sortButtonActive : undefined]}
+            >
+              <Text style={[styles.sortButtonText, sortMode === 'latest' ? styles.sortButtonTextActive : undefined]}>
+                Latest
+              </Text>
+            </Pressable>
+
+            <Pressable
+              onPress={() => setSortMode('priority')}
+              style={[styles.sortButton, sortMode === 'priority' ? styles.sortButtonActive : undefined]}
+            >
+              <Text
+                style={[
+                  styles.sortButtonText,
+                  sortMode === 'priority' ? styles.sortButtonTextActive : undefined,
+                ]}
               >
-                <Text style={[styles.filterChipText, active ? styles.filterChipTextActive : undefined]}>
-                  {category}
+                Priority
+              </Text>
+            </Pressable>
+
+            <Pressable
+              onPress={() => setRecentOnly((prev) => !prev)}
+              style={[styles.sortButton, recentOnly ? styles.sortButtonActive : undefined]}
+            >
+              <Text style={[styles.sortButtonText, recentOnly ? styles.sortButtonTextActive : undefined]}>
+                24h
+              </Text>
+            </Pressable>
+
+            <Pressable onPress={resetFilters} style={styles.resetButton}>
+              <Text style={styles.resetText}>Reset</Text>
+            </Pressable>
+          </View>
+
+          <View style={styles.statsRow}>
+            <View style={styles.statCard}>
+              <Text style={styles.statLabel}>Today</Text>
+              <Text style={styles.statValue}>{homeStats.todayCount}</Text>
+            </View>
+
+            <View style={styles.statCard}>
+              <Text style={styles.statLabel}>Urgent</Text>
+              <Text style={styles.statValue}>{homeStats.urgentCount}</Text>
+            </View>
+
+            <View style={styles.statCard}>
+              <Text style={styles.statLabel}>Top Zone</Text>
+              <Text numberOfLines={1} style={styles.statValueCompact}>
+                {homeStats.topZone}
+              </Text>
+            </View>
+          </View>
+        </Animated.View>
+
+        <Animated.View
+          onLayout={recordTutorialSectionLayout('items')}
+          style={resolveTutorialSectionStyle('items')}
+        >
+          <View style={styles.sectionHeader}>
+            <Text style={styles.sectionTitle}>Found Items</Text>
+            <View style={styles.sectionHeaderActions}>
+              {focusedItemId ? (
+                <Pressable onPress={() => setFocusedItemId('')} style={styles.clearFocusButton}>
+                  <Text style={styles.clearFocusText}>Clear Focus</Text>
+                </Pressable>
+              ) : null}
+              <Text style={styles.sectionMeta}>{visibleItems.length} visible</Text>
+            </View>
+          </View>
+
+          {showInlineError ? (
+            <View style={styles.inlineErrorWrap}>
+              <MaterialIcons color={colors.error} name="error-outline" size={16} />
+              <Text numberOfLines={2} style={styles.inlineErrorText}>
+                {errorText}
+              </Text>
+            </View>
+          ) : null}
+
+          {isLoading ? (
+            <View style={styles.loadingWrap}>
+              <ActivityIndicator color={colors.primary} size="large" />
+              <Text style={styles.loadingText}>Loading items...</Text>
+            </View>
+          ) : showBlockingError ? (
+            <View style={styles.emptyStateCard}>
+              <MaterialIcons color={colors.error} name="error-outline" size={24} />
+              <Text style={styles.emptyTitle}>Unable to load items</Text>
+              <Text style={styles.emptySubtitle}>{errorText}</Text>
+              <Pressable onPress={() => void loadItems()} style={styles.retryButton}>
+                <Text style={styles.retryButtonText}>Try again</Text>
+              </Pressable>
+            </View>
+          ) : visibleItems.length === 0 ? (
+            <View style={styles.emptyStateCard}>
+              <MaterialIcons color={colors.outline} name="inventory-2" size={24} />
+              <Text style={styles.emptyTitle}>No results</Text>
+              <Text style={styles.emptySubtitle}>
+                Try changing search text or filters to see more items.
+              </Text>
+              <Pressable onPress={resetFilters} style={styles.retryButton}>
+                <Text style={styles.retryButtonText}>Reset filters</Text>
+              </Pressable>
+            </View>
+          ) : (
+            prioritizedVisibleItems.slice(0, 40).map((item) => (
+              <FoundItemCard
+                key={item.id}
+                highlighted={item.id === focusedItemId}
+                item={item}
+                onClaimPress={(target) => openClaimForItem(target, 'manual')}
+              />
+            ))
+          )}
+        </Animated.View>
+
+        <Animated.View
+          onLayout={recordTutorialSectionLayout('actions')}
+          style={resolveTutorialSectionStyle('actions')}
+        >
+          <View style={styles.toolsWrap}>
+            <Text style={styles.toolsTitle}>Quick Actions</Text>
+            <Text style={styles.toolsSubtitle}>
+              Report lost items or start a new claim proof flow. Claim history is now in the History tab.
+            </Text>
+            <ErrorBoundary fallbackMessage="Quick actions encountered an error">
+              <CampusActionStudio
+                claimableItems={claimableItems}
+                claimIntentItemId={claimIntentItemId || undefined}
+                claimIntentNonce={claimIntentNonce}
+                compact
+                layout="quick"
+                onActionsFinished={handleStudioActionsFinished}
+              />
+            </ErrorBoundary>
+          </View>
+        </Animated.View>
+      </ScrollView>
+
+      {isTutorialVisible && activeTutorialStep ? (
+        <View
+          pointerEvents="box-none"
+          style={[
+            styles.tutorialFloatingWrap,
+            tutorialPlacement === 'top'
+              ? { top: Math.max(insets.top + 72, 72) }
+              : { bottom: insets.bottom + 84 },
+          ]}
+        >
+          <View
+            onLayout={(event) => {
+              const nextHeight = event.nativeEvent.layout.height;
+              if (Math.abs(nextHeight - tutorialCardHeight) < 2) {
+                return;
+              }
+
+              setTutorialCardHeight(nextHeight);
+            }}
+            style={[styles.tutorialFloatingCard, { maxHeight: windowHeight * 0.52 }]}
+          >
+            <View style={styles.tutorialHeaderRow}>
+              <Text style={styles.tutorialEyebrow}>
+                Step {tutorialStepIndex + 1} of {HOME_TUTORIAL_STEPS.length}
+              </Text>
+
+              <Pressable onPress={() => closeTutorial(true)} style={styles.tutorialSkipButton}>
+                <Text style={styles.tutorialSkipButtonText}>Skip</Text>
+              </Pressable>
+            </View>
+
+            <Text style={styles.tutorialTitle}>{activeTutorialStep.title}</Text>
+            <Text style={styles.tutorialDescription}>{activeTutorialStep.description}</Text>
+
+            <View style={styles.tutorialTipRow}>
+              <MaterialIcons color={colors.primary} name="lightbulb-outline" size={14} />
+              <Text style={styles.tutorialTipText}>{activeTutorialStep.tip}</Text>
+            </View>
+
+            <View style={styles.tutorialDotsRow}>
+              {HOME_TUTORIAL_STEPS.map((step, index) => {
+                const isActiveDot = index === tutorialStepIndex;
+
+                return (
+                  <View
+                    key={`${step.target}-${index}`}
+                    style={[styles.tutorialDot, isActiveDot ? styles.tutorialDotActive : undefined]}
+                  />
+                );
+              })}
+            </View>
+
+            <View style={styles.tutorialActionsRow}>
+              <Pressable
+                disabled={tutorialStepIndex === 0}
+                onPress={handleTutorialBack}
+                style={({ pressed }) => [
+                  styles.tutorialBackButton,
+                  tutorialStepIndex === 0 ? styles.tutorialBackButtonDisabled : undefined,
+                  pressed && tutorialStepIndex !== 0 ? styles.tutorialButtonPressed : undefined,
+                ]}
+              >
+                <Text style={styles.tutorialBackButtonText}>Back</Text>
+              </Pressable>
+
+              <Pressable
+                onPress={handleTutorialNext}
+                style={({ pressed }) => [
+                  styles.tutorialNextButton,
+                  pressed ? styles.tutorialButtonPressed : undefined,
+                ]}
+              >
+                <Text style={styles.tutorialNextButtonText}>
+                  {tutorialStepIndex >= HOME_TUTORIAL_STEPS.length - 1 ? 'Finish' : 'Next'}
                 </Text>
               </Pressable>
-            );
-          })}
-        </ScrollView>
-
-        <View style={styles.sortRow}>
-          <Pressable
-            onPress={() => setSortMode('latest')}
-            style={[styles.sortButton, sortMode === 'latest' ? styles.sortButtonActive : undefined]}
-          >
-            <Text style={[styles.sortButtonText, sortMode === 'latest' ? styles.sortButtonTextActive : undefined]}>
-              Latest
-            </Text>
-          </Pressable>
-
-          <Pressable
-            onPress={() => setSortMode('priority')}
-            style={[styles.sortButton, sortMode === 'priority' ? styles.sortButtonActive : undefined]}
-          >
-            <Text
-              style={[
-                styles.sortButtonText,
-                sortMode === 'priority' ? styles.sortButtonTextActive : undefined,
-              ]}
-            >
-              Priority
-            </Text>
-          </Pressable>
-
-          <Pressable
-            onPress={() => setRecentOnly((prev) => !prev)}
-            style={[styles.sortButton, recentOnly ? styles.sortButtonActive : undefined]}
-          >
-            <Text style={[styles.sortButtonText, recentOnly ? styles.sortButtonTextActive : undefined]}>
-              24h
-            </Text>
-          </Pressable>
-
-          <Pressable onPress={resetFilters} style={styles.resetButton}>
-            <Text style={styles.resetText}>Reset</Text>
-          </Pressable>
-        </View>
-
-        <View style={styles.statsRow}>
-          <View style={styles.statCard}>
-            <Text style={styles.statLabel}>Today</Text>
-            <Text style={styles.statValue}>{homeStats.todayCount}</Text>
-          </View>
-
-          <View style={styles.statCard}>
-            <Text style={styles.statLabel}>Urgent</Text>
-            <Text style={styles.statValue}>{homeStats.urgentCount}</Text>
-          </View>
-
-          <View style={styles.statCard}>
-            <Text style={styles.statLabel}>Top Zone</Text>
-            <Text numberOfLines={1} style={styles.statValueCompact}>
-              {homeStats.topZone}
-            </Text>
+            </View>
           </View>
         </View>
-
-        <View style={styles.sectionHeader}>
-          <Text style={styles.sectionTitle}>Found Items</Text>
-          <View style={styles.sectionHeaderActions}>
-            {focusedItemId ? (
-              <Pressable onPress={() => setFocusedItemId('')} style={styles.clearFocusButton}>
-                <Text style={styles.clearFocusText}>Clear Focus</Text>
-              </Pressable>
-            ) : null}
-            <Text style={styles.sectionMeta}>{visibleItems.length} visible</Text>
-          </View>
-        </View>
-
-        {showInlineError ? (
-          <View style={styles.inlineErrorWrap}>
-            <MaterialIcons color={colors.error} name="error-outline" size={16} />
-            <Text numberOfLines={2} style={styles.inlineErrorText}>
-              {errorText}
-            </Text>
-          </View>
-        ) : null}
-
-        {isLoading ? (
-          <View style={styles.loadingWrap}>
-            <ActivityIndicator color={colors.primary} size="large" />
-            <Text style={styles.loadingText}>Loading items...</Text>
-          </View>
-        ) : showBlockingError ? (
-          <View style={styles.emptyStateCard}>
-            <MaterialIcons color={colors.error} name="error-outline" size={24} />
-            <Text style={styles.emptyTitle}>Unable to load items</Text>
-            <Text style={styles.emptySubtitle}>{errorText}</Text>
-            <Pressable onPress={() => void loadItems()} style={styles.retryButton}>
-              <Text style={styles.retryButtonText}>Try again</Text>
-            </Pressable>
-          </View>
-        ) : visibleItems.length === 0 ? (
-          <View style={styles.emptyStateCard}>
-            <MaterialIcons color={colors.outline} name="inventory-2" size={24} />
-            <Text style={styles.emptyTitle}>No results</Text>
-            <Text style={styles.emptySubtitle}>
-              Try changing search text or filters to see more items.
-            </Text>
-            <Pressable onPress={resetFilters} style={styles.retryButton}>
-              <Text style={styles.retryButtonText}>Reset filters</Text>
-            </Pressable>
-          </View>
-        ) : (
-          prioritizedVisibleItems.slice(0, 40).map((item) => (
-            <FoundItemCard
-              key={item.id}
-              highlighted={item.id === focusedItemId}
-              item={item}
-              onClaimPress={(target) => openClaimForItem(target, 'manual')}
-            />
-          ))
-        )}
-
-        <View style={styles.toolsWrap}>
-          <Text style={styles.toolsTitle}>Quick Actions</Text>
-          <Text style={styles.toolsSubtitle}>
-            Report lost items or start a new claim proof flow. Claim history is now in the History tab.
-          </Text>
-          <ErrorBoundary fallbackMessage="Quick actions encountered an error">
-            <CampusActionStudio
-              claimableItems={claimableItems}
-              claimIntentItemId={claimIntentItemId || undefined}
-              claimIntentNonce={claimIntentNonce}
-              compact
-              layout="quick"
-              onActionsFinished={handleStudioActionsFinished}
-            />
-          </ErrorBoundary>
-        </View>
-      </ScrollView>
+      ) : null}
     </SafeAreaView>
   );
 }
@@ -1489,6 +1866,9 @@ const styles = StyleSheet.create({
     paddingHorizontal: 18,
     paddingTop: 16,
   },
+  contentTutorialActive: {
+    paddingBottom: 360,
+  },
   heroCard: {
     ...shadows.soft,
     backgroundColor: '#F0F4FF',
@@ -1497,6 +1877,12 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     marginBottom: 14,
     padding: 14,
+  },
+  heroHeaderRow: {
+    flexDirection: 'row',
+  },
+  heroHeaderBody: {
+    flex: 1,
   },
   heroTitle: {
     color: colors.primary,
@@ -1510,6 +1896,29 @@ const styles = StyleSheet.create({
     fontSize: 13,
     lineHeight: 19,
     marginTop: 4,
+  },
+  heroTutorialButton: {
+    alignItems: 'center',
+    alignSelf: 'flex-start',
+    backgroundColor: '#E6EDFF',
+    borderColor: '#C8D5FF',
+    borderRadius: radii.pill,
+    borderWidth: 1,
+    flexDirection: 'row',
+    marginLeft: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+  },
+  heroTutorialButtonPressed: {
+    opacity: 0.84,
+  },
+  heroTutorialButtonText: {
+    color: colors.primary,
+    fontFamily: fontFamily.bodySemiBold,
+    fontSize: 11,
+    letterSpacing: 0.5,
+    marginLeft: 4,
+    textTransform: 'uppercase',
   },
   heroStepsRow: {
     flexDirection: 'row',
@@ -2168,5 +2577,146 @@ const styles = StyleSheet.create({
     fontSize: 12,
     lineHeight: 18,
     marginBottom: 10,
+  },
+  tutorialSectionActive: {
+    backgroundColor: 'rgba(248, 250, 255, 0.95)',
+    borderColor: '#7C96FF',
+    borderRadius: radii.lg,
+    borderWidth: 2,
+    marginBottom: 12,
+    paddingHorizontal: 6,
+    paddingTop: 6,
+    shadowColor: '#2D3E73',
+    shadowOffset: {
+      width: 0,
+      height: 5,
+    },
+    shadowRadius: 14,
+  },
+  tutorialSectionMuted: {
+    opacity: 0.36,
+  },
+  tutorialFloatingWrap: {
+    left: 14,
+    position: 'absolute',
+    right: 14,
+    zIndex: 50,
+  },
+  tutorialFloatingCard: {
+    ...shadows.strong,
+    backgroundColor: '#101F46',
+    borderColor: '#324B8E',
+    borderRadius: radii.lg,
+    borderWidth: 1,
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+  },
+  tutorialHeaderRow: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+  },
+  tutorialEyebrow: {
+    color: '#AFC2FF',
+    fontFamily: fontFamily.bodySemiBold,
+    fontSize: 11,
+    letterSpacing: 0.7,
+    textTransform: 'uppercase',
+  },
+  tutorialSkipButton: {
+    paddingHorizontal: 4,
+    paddingVertical: 2,
+  },
+  tutorialSkipButtonText: {
+    color: '#D6DEFF',
+    fontFamily: fontFamily.bodySemiBold,
+    fontSize: 11,
+    textTransform: 'uppercase',
+  },
+  tutorialTitle: {
+    color: '#FFFFFF',
+    fontFamily: fontFamily.headlineBold,
+    fontSize: 20,
+    marginTop: 8,
+  },
+  tutorialDescription: {
+    color: '#D6DEFF',
+    fontFamily: fontFamily.bodyMedium,
+    fontSize: 12,
+    lineHeight: 18,
+    marginTop: 4,
+  },
+  tutorialTipRow: {
+    alignItems: 'center',
+    backgroundColor: 'rgba(255, 255, 255, 0.08)',
+    borderRadius: radii.md,
+    flexDirection: 'row',
+    marginTop: 9,
+    paddingHorizontal: 9,
+    paddingVertical: 7,
+  },
+  tutorialTipText: {
+    color: '#F2F6FF',
+    flex: 1,
+    fontFamily: fontFamily.bodySemiBold,
+    fontSize: 11,
+    marginLeft: 6,
+  },
+  tutorialDotsRow: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    marginTop: 10,
+  },
+  tutorialDot: {
+    backgroundColor: 'rgba(210, 220, 255, 0.35)',
+    borderRadius: radii.pill,
+    height: 6,
+    marginRight: 6,
+    width: 6,
+  },
+  tutorialDotActive: {
+    backgroundColor: '#FFFFFF',
+    width: 18,
+  },
+  tutorialActionsRow: {
+    flexDirection: 'row',
+    marginTop: 12,
+  },
+  tutorialBackButton: {
+    alignItems: 'center',
+    backgroundColor: 'rgba(255, 255, 255, 0.1)',
+    borderRadius: radii.pill,
+    flex: 1,
+    justifyContent: 'center',
+    marginRight: 8,
+    minHeight: 40,
+  },
+  tutorialBackButtonDisabled: {
+    opacity: 0.45,
+  },
+  tutorialBackButtonText: {
+    color: '#E8EEFF',
+    fontFamily: fontFamily.bodySemiBold,
+    fontSize: 12,
+    letterSpacing: 0.4,
+    textTransform: 'uppercase',
+  },
+  tutorialNextButton: {
+    alignItems: 'center',
+    backgroundColor: '#7E98FF',
+    borderRadius: radii.pill,
+    flex: 1,
+    justifyContent: 'center',
+    minHeight: 40,
+  },
+  tutorialNextButtonText: {
+    color: '#0D1E4A',
+    fontFamily: fontFamily.bodySemiBold,
+    fontSize: 12,
+    letterSpacing: 0.4,
+    textTransform: 'uppercase',
+  },
+  tutorialButtonPressed: {
+    opacity: 0.82,
   },
 });

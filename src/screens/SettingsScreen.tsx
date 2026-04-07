@@ -16,6 +16,7 @@ import {
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { AppTopBar } from '../components/AppTopBar';
+import { isAdminEmail } from '../config/admin';
 import { backendEnv } from '../config/env';
 import { colors, fontFamily, radii, shadows } from '../theme/tokens';
 
@@ -33,6 +34,7 @@ type SettingsTabParamList = {
     | undefined;
   Profile: undefined;
   Settings: undefined;
+  Admin: undefined;
 };
 
 type SettingsFormState = {
@@ -198,6 +200,8 @@ export function SettingsScreen() {
   const userPrimaryEmail = useMemo(() => {
     return user?.primaryEmailAddress?.emailAddress || user?.emailAddresses?.[0]?.emailAddress || '';
   }, [user]);
+
+  const hasAdminAccess = useMemo(() => isAdminEmail(userPrimaryEmail), [userPrimaryEmail]);
 
   const backendBaseUrl = useMemo(() => backendEnv.backendUrl.replace(/\/+$/, ''), []);
 
@@ -615,6 +619,13 @@ export function SettingsScreen() {
                 <MaterialIcons color={colors.primary} name="manage-accounts" size={18} />
                 <Text style={styles.secondaryButtonText}>Open profile editor</Text>
               </Pressable>
+
+              {hasAdminAccess ? (
+                <Pressable onPress={() => navigation.navigate('Admin')} style={styles.secondaryButton}>
+                  <MaterialIcons color={colors.primary} name="admin-panel-settings" size={18} />
+                  <Text style={styles.secondaryButtonText}>Open admin dashboard</Text>
+                </Pressable>
+              ) : null}
 
               <View style={styles.quickActionsRow}>
                 <Pressable onPress={() => navigation.navigate('Home')} style={styles.quickActionButton}>

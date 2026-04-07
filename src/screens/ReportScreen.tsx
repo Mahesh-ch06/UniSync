@@ -1,16 +1,71 @@
 import MaterialIcons from '@expo/vector-icons/MaterialIcons';
 import type { BottomTabNavigationProp } from '@react-navigation/bottom-tabs';
-import { useAuth } from '@clerk/clerk-expo';
+import { useAuth, useUser } from '@clerk/clerk-expo';
 import { useNavigation } from '@react-navigation/native';
 import * as ImagePicker from 'expo-image-picker';
 import { LinearGradient } from 'expo-linear-gradient';
-import { useCallback, useMemo, useState } from 'react';
-import { Image, Modal, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
-import { SafeAreaView } from 'react-native-safe-area-context';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  Animated,
+  Image,
+  LayoutChangeEvent,
+  Modal,
+  Pressable,
+  ScrollView,
+  StyleSheet,
+  Text,
+  TextInput,
+  useWindowDimensions,
+  View,
+} from 'react-native';
+import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { AppTopBar } from '../components/AppTopBar';
 import { backendEnv } from '../config/env';
+import { markTutorialCompleted, shouldShowTutorial } from '../lib/tutorialSeen';
 import { colors, fontFamily, radii, shadows } from '../theme/tokens';
+
+const REPORT_TUTORIAL_STORAGE_KEY = 'report-onboarding-tour-seen-v1';
+
+type ReportTutorialTarget = 'upload' | 'tags' | 'question' | 'submit';
+
+type ReportTutorialStep = {
+  target: ReportTutorialTarget;
+  title: string;
+  description: string;
+  tip: string;
+};
+
+const REPORT_TUTORIAL_STEPS: ReportTutorialStep[] = [
+  {
+    target: 'upload',
+    title: 'Add A Clear Item Photo',
+    description:
+      'Start by uploading a clear image so AI can detect object traits and improve matching quality.',
+    tip: 'Use a close image with good lighting and visible unique details.',
+  },
+  {
+    target: 'tags',
+    title: 'Use AI Tags And Scan',
+    description:
+      'Review and adjust auto-tags after scan to strengthen the backend match signal for your request.',
+    tip: 'Keep only relevant tags to avoid noisy matches.',
+  },
+  {
+    target: 'question',
+    title: 'Set Ownership Proof',
+    description:
+      'Create a specific secret question so only the real owner can answer correctly during verification.',
+    tip: 'Ask about a detail visible only to the true owner.',
+  },
+  {
+    target: 'submit',
+    title: 'Secure Submit And Track',
+    description:
+      'Submit your report to trigger auto-match and open History to monitor status and conversations.',
+    tip: 'After submit, use History for approvals, chat, and pickup completion.',
+  },
+];
 
 const allTags = ['Blue', 'Electronics', 'Apple', 'Case', 'Personalized', 'Small'];
 const REQUEST_TIMEOUT_MS = 15000;
@@ -77,6 +132,24 @@ function readNumber(value: unknown): number {
     if (Number.isFinite(parsed)) {
       return parsed;
     }
+  }
+
+  return 0;
+}
+
+function resolveTimestampMs(value: unknown): number {
+  if (value instanceof Date) {
+    const parsed = value.getTime();
+    return Number.isFinite(parsed) ? parsed : 0;
+  }
+
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value;
+  }
+
+  if (typeof value === 'string') {
+    const parsed = new Date(value).getTime();
+    return Number.isFinite(parsed) ? parsed : 0;
   }
 
   return 0;
@@ -205,8 +278,27 @@ async function readResponseError(response: Response): Promise<string> {
 
 export function ReportScreen() {
   const { getToken } = useAuth();
+  const { user } = useUser();
+  const insets = useSafeAreaInsets();
+  const { height: windowHeight } = useWindowDimensions();
   const navigation = useNavigation<BottomTabNavigationProp<ReportTabParamList, 'Report'>>();
+  const scrollViewRef = useRef<ScrollView | null>(null);
+  const getTokenRef = useRef(getToken);
+  const tutorialCardOpacity = useRef(new Animated.Value(0)).current;
+  const tutorialCardOffset = useRef(new Animated.Value(16)).current;
   const backendBaseUrl = useMemo(() => backendEnv.backendUrl.replace(/\/+$/, ''), []);
+  const currentUserId = readText(user?.id);
+  const userCreatedAtMs = useMemo(() => resolveTimestampMs(user?.createdAt), [user?.createdAt]);
+  const tutorialSyncOptions = useMemo(
+    () => ({
+      tutorialKey: REPORT_TUTORIAL_STORAGE_KEY,
+      userId: currentUserId,
+      backendBaseUrl,
+      getToken: async () => await getTokenRef.current().catch(() => null),
+      userCreatedAtMs,
+    }),
+    [backendBaseUrl, currentUserId, userCreatedAtMs],
+  );
 
   const [selectedTags, setSelectedTags] = useState<string[]>(['Blue', 'Electronics', 'Apple']);
   const [question, setQuestion] = useState('');
@@ -218,6 +310,14 @@ export function ReportScreen() {
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [statusMessage, setStatusMessage] = useState('');
   const [statusTone, setStatusTone] = useState<ReportStatusTone>('neutral');
+  const [isTutorialVisible, setIsTutorialVisible] = useState(false);
+  const [tutorialStepIndex, setTutorialStepIndex] = useState(0);
+  const [tutorialLayouts, setTutorialLayouts] = useState<
+    Partial<Record<ReportTutorialTarget, { y: number; height: number }>>
+  >({});
+  const [tutorialPlacement, setTutorialPlacement] = useState<'top' | 'bottom'>('bottom');
+  const [tutorialCardHeight, setTutorialCardHeight] = useState(0);
+  const [hasTutorialBeenSeen, setHasTutorialBeenSeen] = useState(true);
   const [submissionPopup, setSubmissionPopup] = useState<SubmissionPopupState>({
     visible: false,
     tone: 'success',
@@ -237,6 +337,202 @@ export function ReportScreen() {
   const previewUri =
     selectedImage?.uri ||
     'https://lh3.googleusercontent.com/aida-public/AB6AXuD5orpYUAZ2FU165f--XS5tNxEmJcZa_rgO2SAwnEl6HuIjMATHRMd-T1Q7b-m9x6mfL80YZFImoc436sLb8s1oyvfknVtV-8PScj08_DJxyr8x8p1A8T0hf9u1jipUlSBKBQsl_teW5SgHPybwR5NDRQih7NOWeWZvoqDlydWK8ZeFgRcsOH3q2vQY8OL79qbjUgHQai4nq89nBTheiQSgEHPoC40OGQmlWMWYPQUraLUBFnLB5YoEJR7TC3MkzNeBsrcF6SacPUtC';
+
+  const activeTutorialStep = REPORT_TUTORIAL_STEPS[tutorialStepIndex] ?? REPORT_TUTORIAL_STEPS[0];
+  const showTutorialEntry = Boolean(currentUserId) && !hasTutorialBeenSeen;
+
+  useEffect(() => {
+    getTokenRef.current = getToken;
+  }, [getToken]);
+
+  const recordTutorialLayout = useCallback(
+    (target: ReportTutorialTarget) => (event: LayoutChangeEvent) => {
+      const nextY = event.nativeEvent.layout.y;
+      const nextHeight = event.nativeEvent.layout.height;
+
+      setTutorialLayouts((previous) => {
+        const current = previous[target];
+        if (
+          current &&
+          Math.abs(current.y - nextY) < 2 &&
+          Math.abs(current.height - nextHeight) < 2
+        ) {
+          return previous;
+        }
+
+        return {
+          ...previous,
+          [target]: {
+            y: nextY,
+            height: nextHeight,
+          },
+        };
+      });
+    },
+    [],
+  );
+
+  const markTutorialSeen = useCallback(async () => {
+    if (!tutorialSyncOptions.userId) {
+      return false;
+    }
+
+    setHasTutorialBeenSeen(true);
+
+    return await markTutorialCompleted(tutorialSyncOptions);
+  }, [tutorialSyncOptions]);
+
+  const startTutorial = useCallback(() => {
+    setTutorialStepIndex(0);
+    setIsTutorialVisible(true);
+  }, []);
+
+  const closeTutorial = useCallback(
+    (markSeen: boolean) => {
+      setIsTutorialVisible(false);
+
+      if (markSeen) {
+        void markTutorialSeen();
+      }
+    },
+    [markTutorialSeen],
+  );
+
+  const handleTutorialBack = useCallback(() => {
+    setTutorialStepIndex((previous) => Math.max(0, previous - 1));
+  }, []);
+
+  const handleTutorialNext = useCallback(() => {
+    if (tutorialStepIndex >= REPORT_TUTORIAL_STEPS.length - 1) {
+      closeTutorial(true);
+      setStatusTone('neutral');
+      setStatusMessage('Report tutorial completed. Upload and scan an item image when ready.');
+      return;
+    }
+
+    setTutorialStepIndex((previous) => Math.min(previous + 1, REPORT_TUTORIAL_STEPS.length - 1));
+  }, [closeTutorial, tutorialStepIndex]);
+
+  const resolveTutorialSectionStyle = useCallback(
+    (target: ReportTutorialTarget) => {
+      if (!isTutorialVisible || !activeTutorialStep) {
+        return undefined;
+      }
+
+      if (activeTutorialStep.target === target) {
+        return styles.tutorialSectionActive;
+      }
+
+      return styles.tutorialSectionMuted;
+    },
+    [activeTutorialStep, isTutorialVisible],
+  );
+
+  useEffect(() => {
+    let isMounted = true;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+
+    const maybeShowTutorial = async () => {
+      if (!tutorialSyncOptions.userId) {
+        setHasTutorialBeenSeen(true);
+        setIsTutorialVisible(false);
+        setTutorialStepIndex(0);
+        return;
+      }
+
+      const shouldShow = await shouldShowTutorial(tutorialSyncOptions);
+
+      if (!isMounted) {
+        return;
+      }
+
+      if (!shouldShow) {
+        setHasTutorialBeenSeen(true);
+        return;
+      }
+
+      setHasTutorialBeenSeen(false);
+
+      timer = setTimeout(() => {
+        if (!isMounted) {
+          return;
+        }
+
+        setTutorialStepIndex(0);
+        setIsTutorialVisible(true);
+      }, 520);
+    };
+
+    void maybeShowTutorial();
+
+    return () => {
+      isMounted = false;
+
+      if (timer) {
+        clearTimeout(timer);
+      }
+    };
+  }, [tutorialSyncOptions]);
+
+  useEffect(() => {
+    if (!isTutorialVisible || !activeTutorialStep) {
+      return;
+    }
+
+    const targetLayout = tutorialLayouts[activeTutorialStep.target];
+    if (!targetLayout) {
+      return;
+    }
+
+    const targetMidpoint = targetLayout.y + targetLayout.height * 0.5;
+    const nextPlacement = targetMidpoint > windowHeight * 0.56 ? 'top' : 'bottom';
+
+    if (tutorialPlacement !== nextPlacement) {
+      setTutorialPlacement(nextPlacement);
+    }
+
+    const scrollOffset =
+      nextPlacement === 'top' ? Math.max(tutorialCardHeight + 100, 300) : 102;
+
+    const timer = setTimeout(() => {
+      scrollViewRef.current?.scrollTo({
+        y: Math.max(targetLayout.y - scrollOffset, 0),
+        animated: true,
+      });
+    }, 90);
+
+    return () => {
+      clearTimeout(timer);
+    };
+  }, [
+    activeTutorialStep,
+    isTutorialVisible,
+    tutorialCardHeight,
+    tutorialLayouts,
+    tutorialPlacement,
+    windowHeight,
+  ]);
+
+  useEffect(() => {
+    if (!isTutorialVisible) {
+      tutorialCardOpacity.setValue(0);
+      tutorialCardOffset.setValue(16);
+      return;
+    }
+
+    Animated.parallel([
+      Animated.timing(tutorialCardOpacity, {
+        toValue: 1,
+        duration: 180,
+        useNativeDriver: true,
+      }),
+      Animated.timing(tutorialCardOffset, {
+        toValue: 0,
+        duration: 210,
+        useNativeDriver: true,
+      }),
+    ]).start();
+  }, [isTutorialVisible, tutorialCardOffset, tutorialCardOpacity]);
 
   const updateStatus = useCallback((message: string, tone: ReportStatusTone = 'neutral') => {
     setStatusMessage(message);
@@ -675,85 +971,102 @@ export function ReportScreen() {
         title="UniSync"
       />
 
-      <ScrollView contentContainerStyle={styles.content} showsVerticalScrollIndicator={false}>
-        <Pressable onPress={() => void handlePickImage()} style={styles.uploadZone}>
-          <Image
-            source={{
-              uri: previewUri,
-            }}
-            style={styles.uploadImage}
-          />
-          <View style={styles.uploadOverlay}>
-            <View style={styles.uploadIconCircle}>
-              <MaterialIcons color={colors.onPrimary} name="photo-camera" size={30} />
-            </View>
-            <Text style={styles.uploadTitle}>{selectedImage ? 'Change Photo' : 'Add Object Photo'}</Text>
-            <Text style={styles.uploadHint}>
-              {isPickingImage ? 'Opening gallery...' : 'Tap to choose a clear image for AI matching'}
-            </Text>
-          </View>
-        </Pressable>
-
-        <View style={styles.sectionHeader}>
-          <Text style={styles.sectionTitle}>AI Auto-Tags</Text>
-          <View style={styles.assistantBadge}>
-            <Text style={styles.assistantBadgeText}>Assistant Active</Text>
-          </View>
-        </View>
-
-        <View style={styles.tagsWrap}>
-          {visibleTags.map((tag) => {
-            const selected = selectedTags.includes(tag);
-
-            return (
-              <Pressable
-                key={tag}
-                onPress={() => toggleTag(tag)}
-                style={[styles.tagChip, selected ? styles.tagChipSelected : styles.tagChipIdle]}
-              >
-                <Text style={[styles.tagText, selected ? styles.tagTextSelected : undefined]}>{tag}</Text>
-                {selected ? (
-                  <MaterialIcons
-                    color={colors.onPrimary}
-                    name="check"
-                    size={14}
-                    style={styles.tagIcon}
-                  />
-                ) : null}
-              </Pressable>
-            );
-          })}
-        </View>
-
-        <Pressable
-          disabled={isScanDisabled}
-          onPress={() => void handleAiScan()}
-          style={[styles.scanButton, isScanDisabled ? styles.scanButtonDisabled : undefined]}
-        >
-          <MaterialIcons
-            color={isScanDisabled ? colors.onSurfaceVariant : colors.primary}
-            name="auto-awesome"
-            size={16}
-          />
-          <Text style={[styles.scanButtonText, isScanDisabled ? styles.scanButtonTextDisabled : undefined]}>
-            {isDetecting ? 'Scanning with AI...' : 'Scan With AI'}
-          </Text>
-        </Pressable>
-
-        {scanDetection ? (
-          <View style={styles.scanResultCard}>
-            <Text style={styles.scanResultTitle}>AI Result</Text>
-            <Text style={styles.scanResultMeta}>
-              {scanDetection.label} • {scanDetection.category} •{' '}
-              {Math.round(scanDetection.confidence * 100)}% confidence
-            </Text>
-            {scanDetection.tags.length ? (
-              <Text style={styles.scanResultHint}>
-                Detected tags: {scanDetection.tags.join(', ')}
-              </Text>
-            ) : null}
+      <ScrollView
+        ref={scrollViewRef}
+        contentContainerStyle={[styles.content, isTutorialVisible ? styles.contentTutorialActive : undefined]}
+        showsVerticalScrollIndicator={false}
+      >
+        {showTutorialEntry ? (
+          <View style={styles.tutorialReplayRow}>
+            <Pressable onPress={startTutorial} style={styles.tutorialReplayButton}>
+              <MaterialIcons color={colors.primary} name="tips-and-updates" size={12} />
+              <Text style={styles.tutorialReplayButtonText}>Tutorial</Text>
+            </Pressable>
           </View>
         ) : null}
+
+        <View onLayout={recordTutorialLayout('upload')} style={resolveTutorialSectionStyle('upload')}>
+          <Pressable onPress={() => void handlePickImage()} style={styles.uploadZone}>
+            <Image
+              source={{
+                uri: previewUri,
+              }}
+              style={styles.uploadImage}
+            />
+            <View style={styles.uploadOverlay}>
+              <View style={styles.uploadIconCircle}>
+                <MaterialIcons color={colors.onPrimary} name="photo-camera" size={30} />
+              </View>
+              <Text style={styles.uploadTitle}>{selectedImage ? 'Change Photo' : 'Add Object Photo'}</Text>
+              <Text style={styles.uploadHint}>
+                {isPickingImage ? 'Opening gallery...' : 'Tap to choose a clear image for AI matching'}
+              </Text>
+            </View>
+          </Pressable>
+        </View>
+
+        <View onLayout={recordTutorialLayout('tags')} style={resolveTutorialSectionStyle('tags')}>
+          <View style={styles.sectionHeader}>
+            <Text style={styles.sectionTitle}>AI Auto-Tags</Text>
+            <View style={styles.assistantBadge}>
+              <Text style={styles.assistantBadgeText}>Assistant Active</Text>
+            </View>
+          </View>
+
+          <View style={styles.tagsWrap}>
+            {visibleTags.map((tag) => {
+              const selected = selectedTags.includes(tag);
+
+              return (
+                <Pressable
+                  key={tag}
+                  onPress={() => toggleTag(tag)}
+                  style={[styles.tagChip, selected ? styles.tagChipSelected : styles.tagChipIdle]}
+                >
+                  <Text style={[styles.tagText, selected ? styles.tagTextSelected : undefined]}>{tag}</Text>
+                  {selected ? (
+                    <MaterialIcons
+                      color={colors.onPrimary}
+                      name="check"
+                      size={14}
+                      style={styles.tagIcon}
+                    />
+                  ) : null}
+                </Pressable>
+              );
+            })}
+          </View>
+
+          <Pressable
+            disabled={isScanDisabled}
+            onPress={() => void handleAiScan()}
+            style={[styles.scanButton, isScanDisabled ? styles.scanButtonDisabled : undefined]}
+          >
+            <MaterialIcons
+              color={isScanDisabled ? colors.onSurfaceVariant : colors.primary}
+              name="auto-awesome"
+              size={16}
+            />
+            <Text style={[styles.scanButtonText, isScanDisabled ? styles.scanButtonTextDisabled : undefined]}>
+              {isDetecting ? 'Scanning with AI...' : 'Scan With AI'}
+            </Text>
+          </Pressable>
+
+          {scanDetection ? (
+            <View style={styles.scanResultCard}>
+              <Text style={styles.scanResultTitle}>AI Result</Text>
+              <Text style={styles.scanResultMeta}>
+                {scanDetection.label} • {scanDetection.category} •{' '}
+                {Math.round(scanDetection.confidence * 100)}% confidence
+              </Text>
+              {scanDetection.tags.length ? (
+                <Text style={styles.scanResultHint}>
+                  Detected tags: {scanDetection.tags.join(', ')}
+                </Text>
+              ) : null}
+            </View>
+          ) : null}
+        </View>
 
         <View style={styles.ownershipCard}>
           <MaterialIcons
@@ -767,65 +1080,146 @@ export function ReportScreen() {
             Create a security gate to ensure the item reaches its rightful owner.
           </Text>
 
-          <Text style={styles.questionLabel}>Secret Question</Text>
-          {isQuestionSuggestionAvailable ? (
-            <Pressable
-              disabled={isQuestionSuggestionBusy || isSubmitting}
-              onPress={() => void handleQuickFillQuestion()}
-              style={[
-                styles.quickFillButton,
-                (isQuestionSuggestionBusy || isSubmitting) ? styles.quickFillButtonDisabled : undefined,
-              ]}
-            >
-              <MaterialIcons
-                color={(isQuestionSuggestionBusy || isSubmitting) ? colors.onSurfaceVariant : colors.primary}
-                name="auto-awesome"
-                size={14}
-              />
-              <Text
+          <View onLayout={recordTutorialLayout('question')} style={resolveTutorialSectionStyle('question')}>
+            <Text style={styles.questionLabel}>Secret Question</Text>
+            {isQuestionSuggestionAvailable ? (
+              <Pressable
+                disabled={isQuestionSuggestionBusy || isSubmitting}
+                onPress={() => void handleQuickFillQuestion()}
                 style={[
-                  styles.quickFillButtonText,
-                  (isQuestionSuggestionBusy || isSubmitting) ? styles.quickFillButtonTextDisabled : undefined,
+                  styles.quickFillButton,
+                  (isQuestionSuggestionBusy || isSubmitting) ? styles.quickFillButtonDisabled : undefined,
                 ]}
               >
-                {isQuestionSuggestionBusy ? 'Generating AI question...' : 'Use AI suggested question'}
-              </Text>
-            </Pressable>
-          ) : (
-            <Text style={styles.questionAssistHint}>Upload a photo to unlock AI suggested question.</Text>
-          )}
+                <MaterialIcons
+                  color={(isQuestionSuggestionBusy || isSubmitting) ? colors.onSurfaceVariant : colors.primary}
+                  name="auto-awesome"
+                  size={14}
+                />
+                <Text
+                  style={[
+                    styles.quickFillButtonText,
+                    (isQuestionSuggestionBusy || isSubmitting) ? styles.quickFillButtonTextDisabled : undefined,
+                  ]}
+                >
+                  {isQuestionSuggestionBusy ? 'Generating AI question...' : 'Use AI suggested question'}
+                </Text>
+              </Pressable>
+            ) : (
+              <Text style={styles.questionAssistHint}>Upload a photo to unlock AI suggested question.</Text>
+            )}
 
-          <TextInput
-            multiline
-            onChangeText={setQuestion}
-            placeholder="e.g., What is the lock screen wallpaper?"
-            placeholderTextColor="rgba(118, 118, 131, 0.72)"
-            style={styles.questionInput}
-            value={question}
-          />
+            <TextInput
+              multiline
+              onChangeText={setQuestion}
+              placeholder="e.g., What is the lock screen wallpaper?"
+              placeholderTextColor="rgba(118, 118, 131, 0.72)"
+              style={styles.questionInput}
+              value={question}
+            />
+          </View>
 
-          <Pressable
-            disabled={!canSubmit || isSubmitting}
-            onPress={() => void handleSubmitReport()}
-            style={styles.submitOuter}
-          >
-            <LinearGradient
-              colors={
-                canSubmit && !isSubmitting
-                  ? [colors.primary, colors.primaryContainer]
-                  : ['#A9AECE', '#959AB5']
-              }
-              end={{ x: 1, y: 1 }}
-              start={{ x: 0, y: 0 }}
-              style={styles.submitGradient}
+          <View onLayout={recordTutorialLayout('submit')} style={resolveTutorialSectionStyle('submit')}>
+            <Pressable
+              disabled={!canSubmit || isSubmitting}
+              onPress={() => void handleSubmitReport()}
+              style={styles.submitOuter}
             >
-              <Text style={styles.submitText}>{isSubmitting ? 'Matching...' : 'Secure & Match Item'}</Text>
-            </LinearGradient>
-          </Pressable>
+              <LinearGradient
+                colors={
+                  canSubmit && !isSubmitting
+                    ? [colors.primary, colors.primaryContainer]
+                    : ['#A9AECE', '#959AB5']
+                }
+                end={{ x: 1, y: 1 }}
+                start={{ x: 0, y: 0 }}
+                style={styles.submitGradient}
+              >
+                <Text style={styles.submitText}>{isSubmitting ? 'Matching...' : 'Secure & Match Item'}</Text>
+              </LinearGradient>
+            </Pressable>
 
-          {statusMessage ? <Text style={[styles.statusText, statusToneStyle]}>{statusMessage}</Text> : null}
+            {statusMessage ? <Text style={[styles.statusText, statusToneStyle]}>{statusMessage}</Text> : null}
+          </View>
         </View>
       </ScrollView>
+
+      {isTutorialVisible && activeTutorialStep ? (
+        <View
+          pointerEvents="box-none"
+          style={[
+            styles.tutorialFloatingWrap,
+            tutorialPlacement === 'top'
+              ? { top: Math.max(insets.top + 72, 72) }
+              : { bottom: insets.bottom + 84 },
+          ]}
+        >
+          <Animated.View
+            onLayout={(event) => {
+              const nextHeight = event.nativeEvent.layout.height;
+              if (Math.abs(nextHeight - tutorialCardHeight) < 2) {
+                return;
+              }
+
+              setTutorialCardHeight(nextHeight);
+            }}
+            style={[
+              styles.tutorialFloatingCard,
+              { maxHeight: windowHeight * 0.52 },
+              {
+                opacity: tutorialCardOpacity,
+                transform: [{ translateY: tutorialCardOffset }],
+              },
+            ]}
+          >
+            <View style={styles.tutorialHeaderRow}>
+              <Text style={styles.tutorialEyebrow}>
+                Step {tutorialStepIndex + 1} of {REPORT_TUTORIAL_STEPS.length}
+              </Text>
+
+              <Pressable onPress={() => closeTutorial(true)} style={styles.tutorialSkipButton}>
+                <Text style={styles.tutorialSkipButtonText}>Skip</Text>
+              </Pressable>
+            </View>
+
+            <Text style={styles.tutorialTitle}>{activeTutorialStep.title}</Text>
+            <Text style={styles.tutorialDescription}>{activeTutorialStep.description}</Text>
+
+            <View style={styles.tutorialTipRow}>
+              <MaterialIcons color={colors.primary} name="lightbulb-outline" size={14} />
+              <Text style={styles.tutorialTipText}>{activeTutorialStep.tip}</Text>
+            </View>
+
+            <View style={styles.tutorialDotsRow}>
+              {REPORT_TUTORIAL_STEPS.map((step, index) => (
+                <View
+                  key={`${step.target}-${index}`}
+                  style={[styles.tutorialDot, index === tutorialStepIndex ? styles.tutorialDotActive : undefined]}
+                />
+              ))}
+            </View>
+
+            <View style={styles.tutorialActionsRow}>
+              <Pressable
+                disabled={tutorialStepIndex === 0}
+                onPress={handleTutorialBack}
+                style={[
+                  styles.tutorialBackButton,
+                  tutorialStepIndex === 0 ? styles.tutorialBackButtonDisabled : undefined,
+                ]}
+              >
+                <Text style={styles.tutorialBackButtonText}>Back</Text>
+              </Pressable>
+
+              <Pressable onPress={handleTutorialNext} style={styles.tutorialNextButton}>
+                <Text style={styles.tutorialNextButtonText}>
+                  {tutorialStepIndex >= REPORT_TUTORIAL_STEPS.length - 1 ? 'Finish' : 'Next'}
+                </Text>
+              </Pressable>
+            </View>
+          </Animated.View>
+        </View>
+      ) : null}
 
       <Modal animationType="fade" transparent visible={submissionPopup.visible}>
         <View style={styles.submitPopupBackdrop}>
@@ -868,6 +1262,42 @@ const styles = StyleSheet.create({
     paddingBottom: 36,
     paddingHorizontal: 18,
     paddingTop: 16,
+  },
+  contentTutorialActive: {
+    paddingBottom: 360,
+  },
+  tutorialReplayRow: {
+    alignItems: 'flex-end',
+    marginBottom: 10,
+  },
+  tutorialReplayButton: {
+    alignItems: 'center',
+    backgroundColor: '#E6EEFF',
+    borderColor: '#CEDBFF',
+    borderRadius: radii.pill,
+    borderWidth: 1,
+    flexDirection: 'row',
+    paddingHorizontal: 9,
+    paddingVertical: 6,
+  },
+  tutorialReplayButtonText: {
+    color: colors.primary,
+    fontFamily: fontFamily.bodySemiBold,
+    fontSize: 10,
+    letterSpacing: 0.5,
+    marginLeft: 4,
+    textTransform: 'uppercase',
+  },
+  tutorialSectionActive: {
+    borderColor: '#8BA2FF',
+    borderRadius: radii.lg,
+    borderWidth: 2,
+    marginBottom: 10,
+    paddingHorizontal: 6,
+    paddingVertical: 6,
+  },
+  tutorialSectionMuted: {
+    opacity: 0.35,
   },
   uploadZone: {
     alignItems: 'center',
@@ -1203,5 +1633,125 @@ const styles = StyleSheet.create({
   },
   statusTextError: {
     color: colors.error,
+  },
+  tutorialFloatingWrap: {
+    left: 14,
+    position: 'absolute',
+    right: 14,
+    zIndex: 50,
+  },
+  tutorialFloatingCard: {
+    ...shadows.strong,
+    backgroundColor: '#0F204C',
+    borderColor: '#314A88',
+    borderRadius: radii.lg,
+    borderWidth: 1,
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+  },
+  tutorialHeaderRow: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+  },
+  tutorialEyebrow: {
+    color: '#AFC2FF',
+    fontFamily: fontFamily.bodySemiBold,
+    fontSize: 11,
+    letterSpacing: 0.7,
+    textTransform: 'uppercase',
+  },
+  tutorialSkipButton: {
+    paddingHorizontal: 4,
+    paddingVertical: 2,
+  },
+  tutorialSkipButtonText: {
+    color: '#D6DEFF',
+    fontFamily: fontFamily.bodySemiBold,
+    fontSize: 11,
+    textTransform: 'uppercase',
+  },
+  tutorialTitle: {
+    color: '#FFFFFF',
+    fontFamily: fontFamily.headlineBold,
+    fontSize: 20,
+    marginTop: 8,
+  },
+  tutorialDescription: {
+    color: '#D6DEFF',
+    fontFamily: fontFamily.bodyMedium,
+    fontSize: 12,
+    lineHeight: 18,
+    marginTop: 4,
+  },
+  tutorialTipRow: {
+    alignItems: 'center',
+    backgroundColor: 'rgba(255, 255, 255, 0.08)',
+    borderRadius: radii.md,
+    flexDirection: 'row',
+    marginTop: 9,
+    paddingHorizontal: 9,
+    paddingVertical: 7,
+  },
+  tutorialTipText: {
+    color: '#F2F6FF',
+    flex: 1,
+    fontFamily: fontFamily.bodySemiBold,
+    fontSize: 11,
+    marginLeft: 6,
+  },
+  tutorialDotsRow: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    marginTop: 10,
+  },
+  tutorialDot: {
+    backgroundColor: 'rgba(210, 220, 255, 0.35)',
+    borderRadius: radii.pill,
+    height: 6,
+    marginRight: 6,
+    width: 6,
+  },
+  tutorialDotActive: {
+    backgroundColor: '#FFFFFF',
+    width: 18,
+  },
+  tutorialActionsRow: {
+    flexDirection: 'row',
+    marginTop: 12,
+  },
+  tutorialBackButton: {
+    alignItems: 'center',
+    backgroundColor: 'rgba(255, 255, 255, 0.1)',
+    borderRadius: radii.pill,
+    flex: 1,
+    justifyContent: 'center',
+    marginRight: 8,
+    minHeight: 40,
+  },
+  tutorialBackButtonDisabled: {
+    opacity: 0.45,
+  },
+  tutorialBackButtonText: {
+    color: '#E8EEFF',
+    fontFamily: fontFamily.bodySemiBold,
+    fontSize: 12,
+    letterSpacing: 0.4,
+    textTransform: 'uppercase',
+  },
+  tutorialNextButton: {
+    alignItems: 'center',
+    backgroundColor: '#7E98FF',
+    borderRadius: radii.pill,
+    flex: 1,
+    justifyContent: 'center',
+    minHeight: 40,
+  },
+  tutorialNextButtonText: {
+    color: '#0D1E4A',
+    fontFamily: fontFamily.bodySemiBold,
+    fontSize: 12,
+    letterSpacing: 0.4,
+    textTransform: 'uppercase',
   },
 });
