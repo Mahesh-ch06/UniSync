@@ -10,6 +10,7 @@ dotenv.config();
 
 const app = express();
 const port = Number(process.env.PORT || 10000);
+const host = '0.0.0.0';
 const imageBucket = process.env.SUPABASE_IMAGE_BUCKET || 'campus-items';
 
 const clientOriginRaw = process.env.CLIENT_ORIGIN || '*';
@@ -3662,6 +3663,11 @@ app.post('/api/match-requests/:requestId/messages', requireClerkAuth, async (req
   }
 });
 
-app.listen(port, () => {
-  console.log(`UniSync backend listening on port ${port}`);
+const server = app.listen(port, host, () => {
+  console.log(`UniSync backend listening on http://${host}:${port}`);
+});
+
+server.on('error', (error) => {
+  console.error('Failed to start UniSync backend server', error);
+  process.exit(1);
 });
